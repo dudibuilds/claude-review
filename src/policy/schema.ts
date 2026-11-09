@@ -195,6 +195,17 @@ export const AgentPolicy = z
       .default(["correctness", "security", "cross-repo contract breaks", "error handling"]),
     /** Language for review comments. */
     language: z.string().max(40).default("English"),
+    /**
+     * Extra Claude Code built-in tools to enable (all built-ins are disabled by default). Only
+     * non-executing tools are accepted; shell/file-write/web tools can never be enabled here.
+     */
+    builtin_tools: z.array(z.enum(["Skill", "Task", "Agent", "TodoWrite"])).default([]),
+    /** Plugin marketplaces (git URLs) and plugins (name@marketplace) passed to claude-code-action.
+     *  Plugins are trusted code chosen by devops (they may ship skills, hooks and MCP servers). */
+    plugin_marketplaces: z.array(z.string().url().max(500)).default([]),
+    plugins: z.array(z.string().regex(/^[A-Za-z0-9_.-]+@[A-Za-z0-9_.-]+$/)).default([]),
+    /** Optional slash command / skill to run as the review entry point (e.g. "/acme-review:review"). */
+    entry_command: z.string().regex(/^\/[A-Za-z0-9_.:-]{1,100}$/).optional(),
   })
   .strict();
 
