@@ -140,6 +140,28 @@ ripgrep is always spawned without a shell, with `--json` (or `--files`), `--no-c
 default 8000) and `--` before the pattern. Rust regex is linear-time (no ReDoS); pattern length
 capped at 512.
 
+### Tool loading (no deferral)
+
+Claude Code can defer MCP tools behind its built-in ToolSearch tool. Our agent has no built-in tools
+(`--tools ""`), which the CLI research verified makes MCP tools load as normal, non-deferred tools.
+Belt and braces, required in code:
+- every xsearch and xreview tool is registered with `_meta: {"anthropic/alwaysLoad": true}`;
+- prepare never adds `ToolSearch` to `--tools` / `--allowedTools`, even if policy.agent.builtin_tools
+  is set;
+- the integration test asserts, from the real Claude run's stream-json `system/init` message and
+  tool_use blocks, that our tools were called directly (no ToolSearch call, no "No such tool" errors).
+
+### Design rule: Claude Code's search model, made multi-repo
+
+Claude Code navigates code with three tools — Grep (ripgrep), Glob, Read (line windows) — and Codex
+with plain `rg` / `rg --files` / `sed -n` under a per-call output-token cap. Models are trained on
+exactly that loop. xsearch therefore keeps those three as the core, with the same parameter names and
+defaults (`pattern`, `glob`, `type`, `output_mode` default files_with_matches, `-i`, `-A/-B/-C`
+default 0, `head_limit`, `offset`; Read `offset`/`limit`, `N\t` numbered lines), adds a `repos`
+filter and `repo:path` grouping, and adds only tools that measurably cut reads (outline, symbol body,
+references, PR map). Any tool the real end-to-end runs show the agent does not use, or uses wrongly,
+is removed rather than kept "just in case". Errors always say what to do next.
+
 ## xreview tools (registered only if the capability is enabled)
 
 All writes append one JSON object per line to the draft file (schema in `src/common/draft.ts`).
