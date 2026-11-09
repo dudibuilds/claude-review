@@ -135,9 +135,9 @@ export const SearchPolicy = z
     /** Replace default deny/exclude lists instead of appending (rarely wanted). */
     replace_defaults: z.boolean().default(false),
     redact_secrets: z.boolean().default(true),
-    max_output_chars: z.number().int().min(1000).max(100000).default(12000),
-    max_line_chars: z.number().int().min(80).max(2000).default(240),
-    max_read_lines: z.number().int().min(20).max(5000).default(250),
+    max_output_chars: z.number().int().min(1000).max(100000).default(30000),
+    max_line_chars: z.number().int().min(80).max(2000).default(2000),
+    max_read_lines: z.number().int().min(20).max(5000).default(2000),
     max_filesize: z.string().regex(/^\d+[KMG]?$/).default("1M"),
     timeout_ms: z.number().int().min(500).max(60000).default(8000),
   })

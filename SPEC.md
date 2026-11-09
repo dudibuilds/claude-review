@@ -40,11 +40,9 @@ src/
   common/redact.ts           # redactSecrets(text) -> {text, count}
   common/audit.ts            # audit(event, fields) -> JSON line on stderr (+ optional file)
   common/draft.ts            # Draft schema (zod) shared by review-mcp and publisher
-  search/roots.ts            # repo roots registry: mirror repos + "@pr"; safe path resolution
-  search/rg.ts               # ripgrep runner (spawn, no shell, timeout, --json parsing)
-  search/ctags.ts            # ctags index load/query (JSON lines), outline, symbol ranges
-  search/format.ts           # compact text formatting + output budget/truncation
-  search/server.ts           # MCP server registering xsearch tools
+  search/vfs.ts              # virtual paths (/pr, /repos/o/n) <-> host paths; containment checks
+  search/rg.ts               # ripgrep runner (spawn, no shell, timeout)
+  search/server.ts           # MCP server: ListRepos, PrDiff, Grep, Glob, Read
   review/server.ts           # MCP server registering xreview tools (filtered by policy)
   prepare/prepare.ts         # writes workdir: .mcp config, claude_args, prompt, pr context
   publish/publish.ts         # validate draft vs policy -> GitHub API calls (or --dry-run plan)
@@ -54,9 +52,9 @@ src/
   outcome/notify.ts          # Slack / webhook notifications
   outcome/dispatch.ts        # repository_dispatch
   outcome/retry.ts           # `xrepo retry` sweeper (re-runs postponed reviews)
-  sync/sync.ts               # mirror sync (clone/fetch, atomic swap, ctags index, meta.json)
+  sync/sync.ts               # mirror sync (clone/fetch, atomic swap, meta.json)
 test/                        # vitest; fixtures under test/fixtures
-docker/Dockerfile            # node + ripgrep + universal-ctags, non-root, CLI baked in
+docker/Dockerfile            # node + ripgrep + git, non-root, CLI baked in
 .github/workflows/review.yml # reusable workflow (workflow_call): review job + publish job
 .github/workflows/sync.yml   # scheduled mirror sync on the self-hosted runner
 examples/policy.yaml         # fully commented example manifest
@@ -69,8 +67,7 @@ docs/SECURITY.md, README.md
 ```
 /srv/xrepo/mirror/<owner>/<repo>/current -> snapshots/<sha>   # symlink, atomically swapped
 /srv/xrepo/mirror/<owner>/<repo>/snapshots/<sha>/              # shallow working tree (no .git creds)
-/srv/xrepo/mirror/<owner>/<repo>/meta.json                     # {repo, sha, branch, synced_at}
-/srv/xrepo/mirror/<owner>/<repo>/tags.jsonl                    # ctags JSON index for `current`
+/srv/xrepo/mirror/<owner>/<repo>/meta.json                     # {repo, sha, branch, synced_at, description}
 /etc/xrepo-review/policy.yaml                                  # root-owned, read-only to runner
 ```
 
@@ -81,64 +78,71 @@ $WORK/agent/mcp.json    # MCP config for xsearch + xreview
 $WORK/ctx/pr.json       # PR context (repo, number, base/head sha, title, author, files[])
 $WORK/ctx/diff.patch    # unified diff base...head (zero context lines not required; use -U3)
 $WORK/ctx/policy.resolved.json  # resolved policy for THIS repo (read by MCP servers, not by agent)
-$WORK/ctx/tags.pr.jsonl # ctags index for the PR checkout
 $WORK/out/draft.jsonl   # the ONLY file xreview writes
-$PR_CHECKOUT            # PR head checkout (actions/checkout path), served as repo "@pr"
+$PR_CHECKOUT            # PR head checkout (actions/checkout path), served as /pr
 ```
 The MCP servers receive file paths only via CLI args written by `prepare` (trusted), never from
 tool arguments.
 
-## Repo identifiers inside tools
+## xsearch: Claude Code's Grep / Glob / Read, made multi-repo
 
-- `@pr` = the PR head checkout of the repo under review.
-- `owner/name` = a mirror repo (default branch snapshot). The PR repo's base branch is also
-  available as its `owner/name` if it is in the mirror.
-- Paths are repo-relative POSIX paths. Absolute paths, `..` segments, NUL bytes, backslashes and
-  anything resolving (after realpath) outside the repo root are rejected. `.git/` is always denied.
+Design rule (user decision): give the agent the tools it already knows. Claude Code navigates code
+with Grep (ripgrep), Glob and Read; Codex with `rg`, `rg --files`, `sed -n`. xsearch exposes the same
+three tools with Claude Code's exact names, parameter names, defaults and output formats, plus two
+small tools the review needs (`ListRepos`, `PrDiff`). No symbol indexes, no ctags, no ast-grep, no
+repo maps, no clever ranking. Security limits stay (they are invisible to a well-behaved agent).
 
-## xsearch tools (token-efficient by design)
+### Virtual paths — how "multi-repo" is expressed
 
-All tools return **plain text**, not JSON. Every response respects `policy.search.max_output_chars`
-(default 12000); when truncated, the last line says what was dropped and how to narrow
-(e.g. `… 214 more matches in 37 files — narrow with path_glob or repos, or use page=2`).
-Lines longer than `max_line_chars` (default 240) are cut with `…`. All output passes `redactSecrets`.
-Denied paths (policy.search.deny_globs) are invisible: never listed, matched, or readable.
-Default excluded globs (policy.search.exclude_globs: vendored, lockfiles, minified, generated) are
-skipped by search/find unless the call explicitly targets that path.
+Every path the agent sees or passes is an absolute virtual path:
+- `/pr/<path>` — the PR head checkout of the repository under review;
+- `/repos/<owner>/<name>/<path>` — the mirrored default-branch snapshot of each repo this PR's repo
+  may read (policy `cross_repo`). The PR repo's own base branch is `/repos/<its owner>/<its name>/`
+  when it is mirrored.
+Choosing a repo is choosing a `path` (e.g. `Grep {pattern, path: "/repos/acme/api"}`), exactly like
+Claude Code's `path` parameter. Every tool prints virtual paths so results can be passed straight to
+Read. Anything outside `/pr` and the readable `/repos/*` does not exist (ENOENT-style error listing
+the valid roots). Unreadable repos are never listed, not even their names.
 
-1. `list_repos()` → one line per readable repo: `owner/name  sha7  synced 2h ago  — description`
-   (plus `@pr  head=sha7 base=sha7  <N files changed>`).
-2. `pr_overview()` → title, author, base/head, and changed files with `+adds -dels status`, one per line.
-3. `pr_diff({path?, max_lines?})` → unified diff hunks for one file (or all, budgeted).
-4. `search({pattern, literal?=false, case_sensitive?=false, repos?, path_glob?, file_type?,
-   context?=0..5 (default 1), mode?='content'|'files'|'count', max_matches?=50, page?=1})`
-   → ripgrep across allowed repos. Content mode output, grouped by file:
+### Tools (MCP names `mcp__xsearch__<Name>`; all output is plain text)
+
+1. `ListRepos()` — like `ls` of the roots:
    ```
-   ## owner/repo:path/to/file.ts
-   41-  const x = 1
-   42:  createOrder(x)
+   /pr                 acme/web  PR #42  head 1a2b3c4 base 9f8e7d6  5 files changed
+   /repos/acme/api     4d5e6f7  synced 3m ago  Orders API
+   /repos/acme/web     9f8e7d6  synced 3m ago  (base branch of this PR)
    ```
-   Overlapping context ranges merge. `repos` defaults to all readable repos incl. `@pr`.
-5. `find_files({glob, repos?, max_results?=100})` → matching paths (like fd), grouped by repo.
-6. `tree({repo, path?='', depth?=2})` → compact directory tree; dirs suffixed `/`, child counts
-   shown for truncated dirs.
-7. `read_file({repo, path, start_line?, end_line?})` → numbered lines `N\ttext`; default window
-   `policy.search.max_read_lines` (default 250). Header: `owner/repo:path (lines a-b of total)`.
-   If more remains, footer says how to continue.
-8. `outline({repo, path})` → symbols in a file from ctags: `kind name  Lstart-Lend  (scope)`.
-   Falls back to a regex heuristic for common languages if no tags.
-9. `find_symbol({name, kind?, repos?, max_results?=20})` → definitions across repos:
-   `owner/repo:path:line  kind  name  (scope)` using ctags indexes (exact name, then prefix).
-10. `read_symbol({repo, path?, name})` → the full source of a symbol using ctags start/end lines
-    (capped by max_read_lines, with numbered lines). If ambiguous, lists candidates.
-11. `find_references({name, repos?, path_glob?, max_matches?=50})` → word-boundary search
-    (`\bname\b`, fixed-string aware) excluding the definition lines, grouped by repo/file, context 0.
+2. `PrDiff({file_path?, offset?, limit?})` — no file_path: changed files, one per line
+   `M  +12 -3  /pr/src/orders.ts` (A/M/D/R, renames `old -> new`); with file_path (`/pr/...`): that
+   file's unified diff (`-U3`), hunk headers keep new-side line numbers; offset/limit window long
+   diffs by line like Read. Denied files: `[content hidden by policy]`.
+3. `Grep({pattern, path?, glob?, type?, output_mode?, "-i"?, "-n"?, "-A"?, "-B"?, "-C"?, context?,
+   multiline?, head_limit?, offset?})` — Claude Code semantics. `path` (file or directory) defaults to
+   all roots (`/pr` + every readable `/repos/...`). `output_mode`: `files_with_matches` (default),
+   `content`, `count`. `-n` default true in content mode. `head_limit` default 250 (0 = no limit,
+   still capped by max_output_chars), `offset` skips that many entries first. Output:
+   files_with_matches → one virtual path per line; content → ripgrep style `path:line:text`, context
+   lines `path-line-text`, groups separated by `--`; count → `path:N`. When head_limit cut results,
+   append `[Showing results with pagination = limit: 250, offset: 0]` (same wording as Claude Code).
+   Lines longer than 500 chars are cut with `… [line truncated]`.
+4. `Glob({pattern, path?})` — matching files as virtual paths, sorted by path, max 100 then
+   `(Results are truncated. Consider using a more specific path or pattern.)`.
+5. `Read({file_path, offset?, limit?})` — `cat -n` format (right-aligned line number, tab, text),
+   offset = first line (1-based), default limit = policy.search.max_read_lines (default 2000, Claude
+   Code's default), lines longer than 2000 chars truncated. File bigger than max_filesize → error
+   telling the agent to use offset/limit or Grep (as Claude Code does). Directory → error suggesting
+   Glob. Binary → `[binary file]`.
 
-ripgrep is always spawned without a shell, with `--json` (or `--files`), `--no-config`,
-`--max-columns`, `--max-filesize` (policy, default 1M), `--hidden` + explicit `--glob !.git`,
-`--no-follow`, deny/exclude globs as `--glob !...`, a hard timeout (policy.search.timeout_ms,
-default 8000) and `--` before the pattern. Rust regex is linear-time (no ReDoS); pattern length
-capped at 512.
+Implementation: ripgrep spawned without a shell (`stdio[0]='ignore'`, explicit paths, `--no-config`,
+`--no-follow`, `--hidden` + `--glob !.git`, deny/exclude globs as `--glob !…`, `--max-filesize`,
+`--` before patterns / `-e`), one rg process over all target roots, timeout from policy. Output
+rewritten from host paths to virtual paths. Every response capped at policy.search.max_output_chars
+(default 30000, like Claude Code's tool output cap) with a one-line truncation note. redactSecrets on
+all output. `exclude_globs` (lockfiles, minified, vendored) are skipped by Grep/Glob unless `path`/
+`glob` explicitly targets them — the same effect ripgrep's .gitignore handling has in Claude Code.
+
+Tool descriptions: short, written like Claude Code's own (what it does, key params, "use Grep to find
+then Read with offset/limit"), plus one line on virtual paths. Errors say what to do next.
 
 ### Tool loading (no deferral)
 
@@ -150,17 +154,6 @@ Belt and braces, required in code:
   is set;
 - the integration test asserts, from the real Claude run's stream-json `system/init` message and
   tool_use blocks, that our tools were called directly (no ToolSearch call, no "No such tool" errors).
-
-### Design rule: Claude Code's search model, made multi-repo
-
-Claude Code navigates code with three tools — Grep (ripgrep), Glob, Read (line windows) — and Codex
-with plain `rg` / `rg --files` / `sed -n` under a per-call output-token cap. Models are trained on
-exactly that loop. xsearch therefore keeps those three as the core, with the same parameter names and
-defaults (`pattern`, `glob`, `type`, `output_mode` default files_with_matches, `-i`, `-A/-B/-C`
-default 0, `head_limit`, `offset`; Read `offset`/`limit`, `N\t` numbered lines), adds a `repos`
-filter and `repo:path` grouping, and adds only tools that measurably cut reads (outline, symbol body,
-references, PR map). Any tool the real end-to-end runs show the agent does not use, or uses wrongly,
-is removed rather than kept "just in case". Errors always say what to do next.
 
 ## xreview tools (registered only if the capability is enabled)
 
@@ -261,7 +254,7 @@ Outputs files under `--work` (see layout) and prints GitHub step outputs (`claud
 - Skip rules from policy (`triggers`): drafts, forks, bots, title markers (`[skip review]`),
   max changed files/lines, ignored authors, `enabled: false` kill switch.
 - Computes diff with `git -C <pr-checkout> diff --no-color -U3 <base>...<head>` (fetch depth
-  must allow it; falls back to `git diff base head`). Builds ctags index for the PR checkout.
+  must allow it; falls back to `git diff base head`).
 - MCP config `mcp.json`: two stdio servers. `launcher=docker` wraps each in
   `docker run --rm -i --network none --read-only --cap-drop ALL --security-opt no-new-privileges
   --user 65534:65534 --tmpfs /tmp ... -v <mirror>:/mirror:ro -v <pr>:/pr:ro -v <ctx>:/ctx:ro
@@ -281,8 +274,7 @@ Outputs files under `--work` (see layout) and prints GitHub step outputs (`claud
 For each repo in `policy.mirror.repos` (explicit list; globs `org/*` resolved via API if allowed):
 shallow fetch default branch into a new snapshot dir using a per-command auth header
 (`git -c http.extraHeader=...`), never persisting credentials; remove `.git` remote URL creds;
-build `tags.jsonl` with `ctags -R --output-format=json --fields=+nKSse --extras=-F`; write
-meta.json; atomically swap `current` symlink (rename of a temp symlink); keep last N snapshots
+delete `.git` from the snapshot; write meta.json; atomically swap `current` symlink (rename of a temp symlink); keep last N snapshots
 (default 2) and delete older ones. Concurrency-safe with a lock file.
 
 ## Non-goals (v1)
