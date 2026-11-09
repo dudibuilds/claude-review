@@ -49,6 +49,11 @@ src/
   prepare/prepare.ts         # writes workdir: .mcp config, claude_args, prompt, pr context
   publish/publish.ts         # validate draft vs policy -> GitHub API calls (or --dry-run plan)
   publish/github.ts          # thin Octokit wrapper (interface so tests can fake it)
+  outcome/classify.ts        # outcome classification (usage_limit / error / incomplete / ...)
+  outcome/template.ts        # message templates with per-channel escaping
+  outcome/notify.ts          # Slack / webhook notifications
+  outcome/dispatch.ts        # repository_dispatch
+  outcome/retry.ts           # `xrepo retry` sweeper (re-runs postponed reviews)
   sync/sync.ts               # mirror sync (clone/fetch, atomic swap, ctags index, meta.json)
 test/                        # vitest; fixtures under test/fixtures
 docker/Dockerfile            # node + ripgrep + universal-ctags, non-root, CLI baked in
@@ -172,6 +177,57 @@ Input: resolved policy, PR context, draft.jsonl, GitHub token (env). Steps:
    review body, per `summary_comment.mode` (`sticky` | `review`).
 7. Labels: only allowed ones.
 8. `--dry-run` prints the full plan as JSON and makes no API calls. Every decision is audited.
+
+## Outcomes, notifications, retries, workflow chaining
+
+Schema: `outcomes`, `OutcomeActions`, `DEFAULT_OUTCOMES`, `notifications` in `src/policy/schema.ts`.
+`resolvePolicy` deep-merges DEFAULT_OUTCOMES <- defaults.outcomes <- repos[x].outcomes per outcome
+(arrays replace) and copies `notifications` into the resolved policy.
+
+Module `src/outcome/` (no AI, runs in the publish job):
+- `classify.ts`: `classifyOutcome(input:{skipped?:{reason:string}, agentStepOutcome?: 'success'|'failure'|'cancelled'|'skipped'|string, executionFileText?: string, draft?: Draft}): {outcome: 'completed'|'incomplete'|'usage_limit'|'error'|'skipped', reason: string, reset_at?: string}`.
+  Order: skipped → usage_limit (execution file result/error text or any assistant/system message
+  matching usage-limit/rate-limit/429/quota/overloaded/credit-balance patterns; parse reset time:
+  `limit reached|<epoch>` → ISO, `resets <text>` → raw text) → completed (draft.finished) →
+  incomplete (draft has entries or result subtype `error_max_turns`) → error (reason from step outcome
+  / result subtype / "no output"). Robust to execution_file being a JSON array, JSON lines, or absent.
+- `template.ts`: `renderTemplate(tpl, vars, escape: (s)=>string)`; unknown placeholders left
+  literally; values escaped per channel (markdown → sanitizeMarkdown rules, slack → `&<>` escaped,
+  `<!`/`@` neutralized, length capped). `{reset_at_suffix}` = ` (resets <reset_at>)` or "".
+- `notify.ts`: `sendNotifications(refs, targets, vars, secrets, fetchImpl?)` → Slack incoming webhook
+  `{text}` / generic webhook JSON `{event:'xrepo-review', outcome, repo, pr_number, pr_url, verdict,
+  reason, reset_at, findings, top_severity, run_url, attempt, message}` with optional HMAC header.
+  Secrets bundle = JSON object from env `XREPO_NOTIFY_SECRETS`, else file
+  `/etc/xrepo-review/notify.json` (path overridable by flag). Only https URLs; timeouts; failures
+  are audited and never fail the publish.
+- `dispatch.ts`: repository_dispatch with token env `XREPO_DISPATCH_TOKEN` (fallback GITHUB_TOKEN only
+  when target repo == PR repo); client_payload ≤ 10 top-level keys.
+- `retry.ts`: `xrepo retry` sweeper (central scheduled workflow, GitHub App token with actions:write,
+  pull-requests:write): for each open PR carrying a retry label in the policy's repos, find the latest
+  run of the review workflow for that PR's head sha; if `run_attempt < max_attempts` re-run it
+  (POST /actions/runs/{id}/rerun); else remove the label and comment once.
+
+Publisher flow with outcomes (`xrepo publish`): extra flags `--agent-outcome`, `--execution-file`,
+`--skip-reason`, `--run-url`, `--run-attempt`, `--github-output`. Steps: classify → if completed or
+incomplete, build/execute the review plan (incomplete never approves/blocks) → derive extra outcomes
+`approved`/`blocked` from the executed plan → for each fired outcome (primary first, then
+approved/blocked): post `comment` (into the sticky comment; a completed review's summary stays primary
+and outcome comments are appended), set check conclusion (outcome override wins over the plan's
+default only for non-completed outcomes; for completed the plan decides unless configured),
+add/remove labels, notify, dispatch, retry labelling (`retry.enabled` and run_attempt <
+max_attempts → add retry label; on `completed` always remove any configured retry labels) → write
+step outputs `outcome, verdict, reason, reset_at, findings, top_severity` → exit 1 only if a fired
+outcome has `fail_job: true` (or on infrastructure failure of required API calls).
+
+Workflow chaining: `review.yml` exposes those outputs as `on.workflow_call.outputs`, so callers add
+jobs like `if: needs.review.outputs.outcome == 'usage_limit'`. The claude-code-action step uses
+`continue-on-error: true`; the publish job runs `if: always()` (unless the run was cancelled) and gets
+the action's outcome + execution file via the artifact.
+
+Accounts: the reusable workflow reads `CLAUDE_CODE_OAUTH_TOKEN` (or `ANTHROPIC_API_KEY`) via
+`secrets: inherit`; per-group accounts = org secrets with the same name scoped to repo groups, or an
+optional `account` input selecting `CLAUDE_CODE_OAUTH_TOKEN_<ACCOUNT>`. No automatic failover between
+personal subscriptions (terms risk) — documented in README.
 
 ## prepare (`xrepo prepare`)
 

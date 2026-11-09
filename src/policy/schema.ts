@@ -211,6 +211,121 @@ export const OutputPolicy = z
   })
   .strict();
 
+/* ------------------------------- outcomes ------------------------------ */
+
+/**
+ * Every run ends in exactly one primary outcome; `approved` / `blocked` additionally fire after
+ * `completed` when the published verdict is APPROVE / blocking.
+ * - completed:   draft finished and published.
+ * - incomplete:  agent ran but did not call finish() (max turns, crash mid-way); partial findings
+ *                are published but never approve/block.
+ * - usage_limit: subscription usage limit / API rate limit / quota / overload detected.
+ * - error:       any other failure (action failed, cancelled, timeout, infrastructure).
+ * - skipped:     prepare decided not to review (draft, fork, bot, size, kill switch...).
+ */
+export const OUTCOMES = ["completed", "approved", "blocked", "incomplete", "usage_limit", "error", "skipped"] as const;
+export const OutcomeName = z.enum(OUTCOMES);
+export type OutcomeName = z.infer<typeof OutcomeName>;
+
+const LabelName = z.string().min(1).max(50);
+const SecretKey = z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/, "secret key: [A-Za-z0-9_.-]");
+
+export const NotifyRef = z
+  .object({
+    /** Name of an entry in the top-level `notifications` map. */
+    target: z.string().min(1).max(64),
+    /** Message template; placeholders: {repo} {pr_number} {pr_url} {pr_title} {author} {outcome}
+     *  {reason} {reset_at} {verdict} {findings} {top_severity} {run_url} {attempt}. */
+    message: z.string().max(2000).optional(),
+  })
+  .strict();
+
+export const OutcomeActions = z
+  .object({
+    /** Text for the sticky PR comment (template, same placeholders as notify). Empty = none. */
+    comment: z.string().max(4000).default(""),
+    /** Conclusion of the check-run (only if check.enabled or block uses a check). */
+    check_conclusion: z.enum(["success", "neutral", "failure", "skipped", "action_required"]).optional(),
+    /** Devops-configured labels (not limited by capabilities.labels.allowed). */
+    add_labels: z.array(LabelName).default([]),
+    remove_labels: z.array(LabelName).default([]),
+    notify: z.array(NotifyRef).default([]),
+    /** Send repository_dispatch {event_type} with an outcome payload (token: env XREPO_DISPATCH_TOKEN). */
+    dispatch: z
+      .object({
+        /** owner/name; default = the PR repository. */
+        repo: RepoName.optional(),
+        event_type: z.string().regex(/^[A-Za-z0-9._:-]{1,100}$/),
+      })
+      .strict()
+      .optional(),
+    /** Mark the PR for automatic re-run by the `xrepo retry` sweeper (usage_limit / error only). */
+    retry: z
+      .object({
+        enabled: z.boolean().default(false),
+        max_attempts: z.number().int().min(1).max(10).default(3),
+        label: LabelName.default("xrepo-review:retry"),
+      })
+      .strict()
+      .optional(),
+    /** Exit non-zero so the workflow run shows as failed (default false: never block on infra). */
+    fail_job: z.boolean().default(false),
+  })
+  .strict();
+export type OutcomeActions = z.infer<typeof OutcomeActions>;
+
+/** Safe built-in defaults; manifests override per outcome (deep-merged). */
+export const DEFAULT_OUTCOMES: Record<OutcomeName, Partial<z.input<typeof OutcomeActions>>> = {
+  completed: {},
+  approved: {},
+  blocked: {},
+  incomplete: {
+    comment:
+      "⚠️ The automated review did not finish ({reason}). Partial findings are shown; this review never approves or blocks.",
+    check_conclusion: "neutral",
+  },
+  usage_limit: {
+    comment:
+      "⏸️ Automated review postponed: Claude usage limit reached{reset_at_suffix}. This does not block merging.",
+    check_conclusion: "neutral",
+  },
+  error: {
+    comment: "⚠️ Automated review could not run ({reason}). This does not block merging. [Run log]({run_url})",
+    check_conclusion: "neutral",
+  },
+  skipped: { check_conclusion: "skipped" },
+};
+
+export const NotificationTarget = z
+  .object({
+    type: z.enum(["slack", "webhook"]),
+    /**
+     * Key of the URL inside the secrets bundle: env XREPO_NOTIFY_SECRETS (JSON object) or the file
+     * /etc/xrepo-review/notify.json. URLs never appear in the manifest.
+     */
+    url_secret: SecretKey,
+    /** webhook only: key of an HMAC-SHA256 secret; adds X-Xrepo-Signature: sha256=<hex>. */
+    hmac_secret: SecretKey.optional(),
+    /** Default message template when a NotifyRef has none. */
+    template: z.string().max(2000).optional(),
+    timeout_ms: z.number().int().min(500).max(30000).default(5000),
+  })
+  .strict();
+export type NotificationTarget = z.infer<typeof NotificationTarget>;
+
+export const ResolvedOutcomes = z
+  .object({
+    completed: OutcomeActions,
+    approved: OutcomeActions,
+    blocked: OutcomeActions,
+    incomplete: OutcomeActions,
+    usage_limit: OutcomeActions,
+    error: OutcomeActions,
+    skipped: OutcomeActions,
+  })
+  .strict();
+export type ResolvedOutcomes = z.infer<typeof ResolvedOutcomes>;
+
 /* ------------------------------ composition ---------------------------- */
 
 /** Everything that can be set globally (`defaults`) or per repo (`repos.<owner/name>`). */
@@ -223,6 +338,8 @@ export const PolicyLayer = z
     triggers: TriggerPolicy.partial().optional(),
     agent: AgentPolicy.partial().optional(),
     output: OutputPolicy.partial().optional(),
+    /** Per-outcome actions; each outcome object deep-merges over DEFAULT_OUTCOMES. */
+    outcomes: z.record(OutcomeName, OutcomeActions.deepPartial()).optional(),
   })
   .strict();
 export type PolicyLayer = z.infer<typeof PolicyLayer>;
@@ -245,8 +362,27 @@ export const PolicyFile = z
     defaults: PolicyLayer.default({}),
     repos: z.record(RepoName, PolicyLayer).default({}),
     mirror: MirrorPolicy.default({}),
+    /** Named notification targets (global). Referenced from outcomes.*.notify[].target. */
+    notifications: z.record(z.string().regex(/^[A-Za-z0-9_.-]{1,64}$/), NotificationTarget).default({}),
   })
-  .strict();
+  .strict()
+  .superRefine((file, ctx) => {
+    // Every notify target referenced anywhere must exist (fail closed on typos).
+    const layers: [string, PolicyLayer][] = [["defaults", file.defaults], ...Object.entries(file.repos)];
+    for (const [where, layer] of layers) {
+      for (const [outcome, actions] of Object.entries(layer.outcomes ?? {})) {
+        for (const [i, ref] of (actions?.notify ?? []).entries()) {
+          if (ref?.target && !(ref.target in file.notifications)) {
+            ctx.addIssue({
+              code: z.ZodIssueCode.custom,
+              path: [where === "defaults" ? "defaults" : "repos", ...(where === "defaults" ? [] : [where]), "outcomes", outcome, "notify", i, "target"],
+              message: `unknown notification target "${ref.target}"`,
+            });
+          }
+        }
+      }
+    }
+  });
 export type PolicyFile = z.infer<typeof PolicyFile>;
 
 /** Fully-resolved policy for one repository (defaults <- repo override), all fields concrete. */
@@ -260,6 +396,10 @@ export const ResolvedPolicy = z
     triggers: TriggerPolicy,
     agent: AgentPolicy,
     output: OutputPolicy,
+    /** All 7 outcomes present, fully defaulted. */
+    outcomes: ResolvedOutcomes,
+    /** Copied from the policy file so the publisher has everything in one resolved file. */
+    notifications: z.record(z.string(), NotificationTarget),
   })
   .strict();
 export type ResolvedPolicy = z.infer<typeof ResolvedPolicy>;
