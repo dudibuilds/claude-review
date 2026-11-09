@@ -30,7 +30,8 @@ export const PrContext = z.object({
   author: z.string(),
   author_type: z.enum(["User", "Bot", "Organization", "Unknown"]),
   base_sha: z.string().min(1),
-  head_sha: z.string().min(1),
+  /** Full 40-hex commit sha: the publisher compares it in full (never as a prefix). */
+  head_sha: z.string().regex(/^[0-9a-f]{40}$/i, "expected a full 40-hex commit sha"),
   base_ref: z.string(),
   head_ref: z.string(),
   draft: z.boolean(),

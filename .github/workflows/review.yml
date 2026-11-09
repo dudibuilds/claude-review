@@ -14,13 +14,16 @@
 #            (its name is the job output `artifact`).
 #   publish  The only job with a write token. No PR checkout. Downloads exactly that artifact,
 #            re-resolves the policy from the trusted manifest and runs the deterministic publisher
-#            (`xrepo publish`, no AI). Fails closed: when the review job uploaded its context but it
+#            (`xrepo publish`, no AI) for the PR this run is for (repo, number and head sha from
+#            the event, never from the artifact). Fails closed: when the review job uploaded its context but it
 #            cannot be downloaded, nothing is published (no "error" comment, no neutral check).
 #
 # Re-runs: "Re-run all jobs" (and the `xrepo retry` sweeper) review again. "Re-run this job" on
 # publish, or "Re-run failed jobs" when only publish failed, republishes the same review from the
 # artifact of the attempt that produced it (3-day retention; once expired, publish fails without
-# changing anything and only a full re-run helps).
+# changing anything and only a full re-run helps). Once a newer workflow run has published (its
+# hidden run marker on the sticky comment or on one of our reviews), an older run's re-run posts
+# only its check (nothing when no check is configured).
 #
 # Token limits of the publish job (deliberate): `contents: read`, so repository_dispatch outcome
 # actions (which need contents: write) always use the XREPO_DISPATCH_TOKEN secret, also for the PR's
@@ -81,7 +84,7 @@ on:
         type: string
         default: docker
       fetch_depth:
-        description: "Commits fetched for the PR checkout (0 = all; base...head needs the merge base, otherwise the diff comes from the GitHub API)."
+        description: "Commits fetched for the PR checkout (0 = all; in a shallow checkout base...head is used only when base is an ancestor of head within the fetched history, otherwise the diff comes from the GitHub API)."
         type: number
         default: 0
       xrepo_repo:
@@ -518,6 +521,10 @@ jobs:
           # one): GitHub gives those runs a read-only token whatever `permissions:` say.
           FORK_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          # The pull request this run is for, from the workflow (never from the artifact, which
+          # passed through the agent's job): the publisher refuses a ctx/pr.json that disagrees.
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           D="$RUNNER_TEMP/xrepo-review"
@@ -547,7 +554,9 @@ jobs:
           if [ -z "$agent" ] && [ -f "$D/agent-outcome.txt" ]; then agent="$(head -c 40 "$D/agent-outcome.txt" | tr -cd 'a-z_')"; fi
           if [ -z "$agent" ]; then agent="$REVIEW_RESULT"; fi
           args=(publish --ctx "$D/ctx" --draft "$D/out/draft.jsonl" --policy "$policy"
-                --run-url "$RUN_URL" --run-attempt "$GITHUB_RUN_ATTEMPT")
+                --run-url "$RUN_URL" --run-attempt "$GITHUB_RUN_ATTEMPT"
+                --repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER")
+          if [ -n "$EVENT_HEAD_SHA" ]; then args+=(--head-sha "$EVENT_HEAD_SHA"); fi
           if [ -n "$agent" ]; then args+=(--agent-outcome "$agent"); fi
           if [ -f "$D/execution.json" ]; then args+=(--execution-file "$D/execution.json"); fi
           if [ "$SKIP" = "true" ]; then args+=(--skip-reason "${SKIP_REASON:-skipped by policy}"); fi

@@ -8,22 +8,35 @@
  *     [--github-output <path>  (default $GITHUB_OUTPUT)] [--notify-secrets-file <path>]
  *     [--policy <manifest.yaml>  (trusted manifest; when given, ctx/policy.resolved.json is ignored)]
  *     [--self-login <login>  (identity of the token, e.g. "my-app[bot]"; see publish/github.ts)]
+ *     [--repo <owner/name> --pr-number <n> [--head-sha <40-hex>]  (the workflow's pull request;
+ *      required when GITHUB_ACTIONS=true)]
  *
  * Flow (SPEC "Outcomes, notifications, retries, workflow chaining"):
  *  1. load ctx (pr.json, diff.patch), draft and execution file; every input may be missing (the
- *     review job can fail early): the PR falls back to $GITHUB_EVENT_PATH. The policy is resolved
- *     from the trusted manifest (--policy) whenever it is given; ctx/policy.resolved.json, which
- *     passed through the agent's job, is only used without --policy (tests, local runs);
+ *     review job can fail early): the PR falls back to $GITHUB_EVENT_PATH. ctx passed through the
+ *     agent's job: with --repo / --pr-number (and --head-sha, the event's head) the PR identity
+ *     comes from the workflow, and a pr.json that disagrees with it publishes nothing (exit 1).
+ *     Without --head-sha (workflow_dispatch), pr.json's head is only used once GitHub confirms it
+ *     is the PR head (freshness; otherwise nothing is published, exit 1; a stale run then posts no
+ *     check). The policy is resolved from the trusted manifest (--policy) whenever it is given;
+ *     ctx/policy.resolved.json, which passed through the agent's job, is only used without
+ *     --policy (tests, local runs);
  *  2. classify -> completed | incomplete | usage_limit | error | skipped; a policy with
  *     `enabled: false` (kill switch, possibly flipped after prepare) turns every run into skipped.
  *     Freshness (GitHubApi.runFreshness, best effort): a run that no longer reviews the pull
- *     request's head (a re-run of an older workflow run, or a push while it ran), or whose commit a
- *     newer workflow run already published, is "stale": it posts only its check run (which never
+ *     request's head (a re-run of an older workflow run, or a push while it ran), or after which a
+ *     newer workflow run already published (its check on the commit, or its run marker on our
+ *     sticky comment / reviews), is "stale": it posts only its check run (which never
  *     overwrites a newer run's check, see github.ts) and writes its outputs; no review, dismissal,
- *     sticky comment, labels, notifications or dispatch, and no `approved` / `blocked`;
+ *     sticky comment, labels, notifications or dispatch, and no `approved` / `blocked`. The head is
+ *     verified once more right before the review is posted (createReview): a push in between
+ *     makes the run stale too, and a pull request that cannot be read then posts no review (a
+ *     failed review post, exit 1). The sticky comment ends with this run's marker (with GITHUB_RUN_ID);
  *  3. completed / incomplete: build the review plan (incomplete never approves or blocks), post the
- *     review. When GitHub refuses the APPROVE / REQUEST_CHANGES event itself, or the approval is
- *     withheld because the head moved, the review is posted as a COMMENT and the plan is adjusted
+ *     review. An APPROVE is withheld unless approve.never_paths / approve.max_changed_lines also
+ *     hold on GitHub's own file list for the PR (approvalGateFailure). When GitHub refuses the
+ *     APPROVE / REQUEST_CHANGES event itself, or the approval is withheld (PR not open, or the
+ *     file-list gates), the review is posted as a COMMENT and the plan is adjusted
  *     (planAfterRefusedEvent): no `approved` / `blocked` unless a failing check still blocks. A
  *     finished run that does not request changes via a review dismisses our earlier approvals and
  *     our CHANGES_REQUESTED reviews on older commits (dismissStaleChangeRequests); every other run
@@ -82,14 +95,17 @@ import {
   slackEscaper,
   type TemplateVars,
 } from "../outcome/template.js";
-import { inlineCommentsEnabled } from "../review/rules.js";
+import { approveBlockers, inlineCommentsEnabled } from "../review/rules.js";
 import {
   createGitHubApi,
+  runMarker,
+  StaleHeadError,
   type CheckRunResult,
   type CreateReviewResult,
   type DismissResult,
   type GitHubApi,
   type GitHubApiOptions,
+  type PullRequestFile,
   type RunFreshness,
 } from "./github.js";
 import { buildPlan, runStatusStickyBody, STICKY_MARKER, stickyCommentBody, type CheckRunConclusion, type PublishPlan } from "./plan.js";
@@ -101,8 +117,20 @@ const MAX_OUTCOME_COMMENT_CHARS = 6000;
 const MAX_CHECK_TITLE = 200;
 const RETRYABLE_OUTCOMES = new Set<OutcomeName>(["usage_limit", "error"]);
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
 
 /* --------------------------------- types --------------------------------- */
+
+/**
+ * The pull request this workflow runs for (--repo, --pr-number, --head-sha), from the workflow
+ * context. ctx/pr.json passed through the agent's job and must agree with it.
+ */
+export interface TrustedPr {
+  repo: string;
+  number: number;
+  /** The event's head (pull_request events); absent for workflow_dispatch. */
+  head_sha?: string;
+}
 
 /** Minimal PR identity: from pr.json, or from the GitHub event when the context is missing. */
 export interface PrInfo {
@@ -307,7 +335,7 @@ export function prFromEvent(env: Record<string, string | undefined>): PrInfo | u
     return {
       repo,
       number,
-      ...(typeof head.sha === "string" && /^[0-9a-f]{7,64}$/i.test(head.sha) ? { head_sha: head.sha } : {}),
+      ...(typeof head.sha === "string" && FULL_SHA_RE.test(head.sha) ? { head_sha: head.sha.toLowerCase() } : {}),
       ...(typeof pr.html_url === "string" ? { html_url: pr.html_url } : {}),
       ...(typeof pr.title === "string" ? { title: pr.title } : {}),
       ...(typeof user.login === "string" ? { author: user.login } : {}),
@@ -315,6 +343,37 @@ export function prFromEvent(env: Record<string, string | undefined>): PrInfo | u
   } catch {
     return undefined;
   }
+}
+
+/** Why ctx/pr.json does not describe the pull request this workflow runs for (undefined: it does). */
+export function identityMismatch(ctx: Pick<PrContext, "repo" | "number" | "head_sha">, trusted: TrustedPr): string | undefined {
+  if (ctx.repo.toLowerCase() !== trusted.repo.toLowerCase()) return `ctx/pr.json names repository ${ctx.repo}, but this workflow runs for ${trusted.repo}`;
+  if (ctx.number !== trusted.number) return `ctx/pr.json names pull request #${ctx.number}, but this workflow runs for #${trusted.number}`;
+  if (trusted.head_sha !== undefined && ctx.head_sha.toLowerCase() !== trusted.head_sha.toLowerCase()) {
+    return `ctx/pr.json names head commit ${ctx.head_sha.slice(0, 12)}, but the event's head is ${trusted.head_sha.slice(0, 12)}`;
+  }
+  return undefined;
+}
+
+/**
+ * Why approve.never_paths / approve.max_changed_lines stop an approval when judged on GitHub's own
+ * file list (the plan judged the artifact's diff, which passed through the agent's job); undefined
+ * when they hold. Fail closed: a list that cannot be read withholds the approval.
+ */
+export async function approvalGateFailure(gh: GitHubApi, policy: ResolvedPolicy): Promise<string | undefined> {
+  let files: PullRequestFile[];
+  try {
+    if (!gh.listPullRequestFiles) throw new Error("the GitHub client cannot list pull request files");
+    files = await gh.listPullRequestFiles();
+    if (!Array.isArray(files)) throw new Error("the GitHub client returned no file list");
+  } catch (e) {
+    audit("publish.approval_files_unavailable", { error: e });
+    return "the pull request's changed files could not be verified";
+  }
+  const paths = [...new Set(files.flatMap((f) => [f.path, f.previous_path ?? ""]).filter((p) => p !== ""))];
+  const changedLines = files.reduce((n, f) => n + f.additions + f.deletions, 0);
+  const fails = approveBlockers(policy, { paths, changedLines }).map((b) => b.message);
+  return fails.length > 0 ? `on GitHub's file list: ${fails.join("; ")}` : undefined;
 }
 
 function defaultRunUrl(env: Record<string, string | undefined>): string | undefined {
@@ -694,7 +753,7 @@ export function writeGithubOutputs(path: string, values: Record<string, string>)
 export const USAGE =
   "usage: xrepo publish --ctx <dir> --draft <file> [--dry-run] [--plan-out <file>] [--agent-outcome <s>] " +
   "[--execution-file <path>] [--skip-reason <s>] [--run-url <url>] [--run-attempt <n>] [--github-output <path>] " +
-  "[--notify-secrets-file <path>] [--policy <manifest>] [--self-login <login>]";
+  "[--notify-secrets-file <path>] [--policy <manifest>] [--self-login <login>] [--repo <owner/name> --pr-number <n> [--head-sha <sha>]]";
 
 const EMPTY_DRAFT: Draft = { comments: [], labels: [], finished: false, invalidLines: 0 };
 
@@ -707,6 +766,7 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
   /* ---- flags ---- */
   let v: Record<string, string | boolean | string[] | undefined>;
   let attempt = 1;
+  let trusted: TrustedPr | undefined;
   try {
     v = parseCli(args, {
       ctx: { type: "string", required: true },
@@ -722,11 +782,25 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
       "notify-secrets-file": { type: "string" },
       policy: { type: "string" },
       "self-login": { type: "string" },
+      repo: { type: "string" },
+      "pr-number": { type: "string" },
+      "head-sha": { type: "string" },
     });
     const rawAttempt = ((v["run-attempt"] as string | undefined) ?? env.GITHUB_RUN_ATTEMPT ?? "").trim();
     if (rawAttempt !== "") {
       if (!/^\d{1,6}$/.test(rawAttempt) || Number(rawAttempt) < 1) throw new Error(`--run-attempt must be a positive integer, got ${JSON.stringify(rawAttempt)}`);
       attempt = Number(rawAttempt);
+    }
+    const tRepo = ((v.repo as string | undefined) ?? "").trim();
+    const tNumber = ((v["pr-number"] as string | undefined) ?? "").trim();
+    const tHead = ((v["head-sha"] as string | undefined) ?? "").trim();
+    if (tRepo !== "" || tNumber !== "" || tHead !== "") {
+      if (!isRepo(tRepo)) throw new Error(`--repo must be owner/name, got ${JSON.stringify(tRepo)}`);
+      if (!/^[1-9]\d{0,9}$/.test(tNumber)) throw new Error(`--pr-number must be a positive integer, got ${JSON.stringify(tNumber)}`);
+      if (tHead !== "" && !FULL_SHA_RE.test(tHead)) throw new Error(`--head-sha must be a full 40-hex commit sha, got ${JSON.stringify(tHead)}`);
+      trusted = { repo: tRepo, number: Number(tNumber), ...(tHead !== "" ? { head_sha: tHead.toLowerCase() } : {}) };
+    } else if (env.GITHUB_ACTIONS === "true") {
+      throw new Error("--repo and --pr-number are required in GitHub Actions: the pull request must come from the workflow, not from the review artifact");
     }
   } catch (e) {
     stderr.write(`xrepo publish: ${(e as Error).message}\n${USAGE}\n`);
@@ -752,7 +826,32 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
     ctxError = shortError(e);
     audit("publish.ctx_missing", { error: e });
   }
-  const pr: PrInfo | undefined = ctx ? prFromContext(ctx) : prFromEvent(env);
+  let pr: PrInfo | undefined = ctx ? prFromContext(ctx) : prFromEvent(env);
+  // ctx/pr.json comes from the agent's job: with the workflow's identity given, it only supplies the
+  // PR's details. Any disagreement publishes nothing (a tampered artifact must not reach another PR).
+  if (trusted) {
+    const mismatch = ctx ? identityMismatch(ctx, trusted) : undefined;
+    if (mismatch !== undefined) {
+      audit("publish.identity_mismatch", { reason: mismatch, repo: trusted.repo, pr: trusted.number });
+      stderr.write(`xrepo publish: refusing to publish anything: ${mismatch}. The review artifact does not belong to this pull request.\n`);
+      return 1;
+    }
+    // Not its run_url: the run's link comes from --run-url or the workflow's environment.
+    const { run_url: _runUrl, ...details }: Partial<PrInfo> = pr && pr.repo.toLowerCase() === trusted.repo.toLowerCase() && pr.number === trusted.number ? pr : {};
+    const head = trusted.head_sha ?? details.head_sha;
+    // The link is built from the identity too: notifications and dispatch payloads carry it.
+    const server = (env.GITHUB_SERVER_URL ?? "").trim().replace(/\/+$/, "") || "https://github.com";
+    pr = {
+      ...details,
+      repo: trusted.repo,
+      number: trusted.number,
+      html_url: `${server}/${trusted.repo}/pull/${trusted.number}`,
+      ...(head !== undefined ? { head_sha: head } : {}),
+    };
+  }
+  // Without the event's head (workflow_dispatch), pr.json's head_sha is only used once GitHub
+  // confirms it is the pull request's head (freshness below).
+  const unverifiedHead = trusted !== undefined && trusted.head_sha === undefined && ctx !== undefined;
 
   // The trusted manifest wins whenever it is given: ctx/policy.resolved.json is an artifact of the
   // agent's job, so it is only read without --policy (tests, local runs).
@@ -861,23 +960,47 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
   // themselves (the writes that need the token report it).
   const optionalApi = (): GitHubApi | undefined => (hasToken ? getApi() : undefined);
 
+  // Neither the event nor ctx names the head (workflow_dispatch whose review job failed early): take
+  // it from GitHub, so the freshness checks (head and newer-run markers) and the check run apply.
+  if (trusted && pr && pr.head_sha === undefined && !dryRun && !integrityError) {
+    let head: string | undefined;
+    try {
+      head = (await getApi()?.getPullRequest?.())?.head_sha;
+    } catch (e) {
+      audit("publish.head_unavailable", { error: e });
+    }
+    if (head === undefined || !FULL_SHA_RE.test(head)) {
+      stderr.write("xrepo publish: refusing to publish anything: the pull request's head could not be read from GitHub (no --head-sha and no ctx/pr.json). Re-run the publish job.\n");
+      return 1;
+    }
+    pr = { ...pr, head_sha: head.toLowerCase() };
+    api = undefined; // the client reviews the head GitHub named
+  }
+
   /* ---- freshness: a stale run publishes only its check ---- */
   let stale: StaleRun | undefined;
+  let headConfirmed = false;
   if (policy && pr?.head_sha && !integrityError) {
     const gh = optionalApi();
     if (gh?.runFreshness) {
       try {
         const f: RunFreshness = await gh.runFreshness(policy.capabilities.check.name);
+        headConfirmed = typeof f.head_sha === "string" && f.head_sha.toLowerCase() === pr.head_sha.toLowerCase();
         if (!f.current) {
           stale = { reason: f.reason ?? "this run no longer reviews the pull request's head", head_sha: f.head_sha, ...(f.newer_run !== undefined ? { newer_run: f.newer_run } : {}) };
           audit("publish.stale_run", { ...stale, outcome: cls.outcome });
         }
       } catch (e) {
-        // Unknown: publish as usual. Approvals are still only submitted for the current head
+        // Unknown: publish as usual. A review is still only posted on the current head
         // (createReview verifies it) and change requests only dismissed by a run for it.
         audit("publish.freshness_unknown", { error: e });
       }
     }
+  }
+  if (unverifiedHead && policy && !integrityError && !dryRun && !headConfirmed && !stale) {
+    audit("publish.head_unverified", { head_sha: pr?.head_sha });
+    stderr.write("xrepo publish: refusing to publish anything: the reviewed commit in ctx/pr.json could not be confirmed as the pull request's head (no --head-sha, and GitHub could not be read). Re-run the publish job.\n");
+    return 1;
   }
 
   /* ---- 3. review plan ---- */
@@ -907,7 +1030,9 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
       if (dryRun) reviewPosted = true;
       else if (gh) {
         try {
-          const r = await gh.createReview(plan.review, { downgradeRefusedEvent: true });
+          // The plan judged the approve gates on the artifact's diff; GitHub's file list decides.
+          const withholdApproval = plan.review.event === "APPROVE" ? await approvalGateFailure(gh, policy) : undefined;
+          const r = await gh.createReview(plan.review, { downgradeRefusedEvent: true, ...(withholdApproval !== undefined ? { withholdApproval } : {}) });
           reviewPosted = true;
           audit("publish.review", { id: r.id, event: r.event ?? plan.review.event, comments: plan.review.comments.length, inline_fallback: r.inlineFallback });
           if (r.downgraded) {
@@ -916,7 +1041,11 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
             audit("publish.review_event_refused", { from: r.downgraded.from, reason: r.downgraded.reason, verdict: plan.verdict, blocked: plan.blocked });
           }
         } catch (e) {
-          infra("creating the review failed", e);
+          if (e instanceof StaleHeadError) {
+            // A push since the freshness read: this run no longer speaks for the pull request.
+            stale = { reason: e.message, head_sha: e.head_sha };
+            audit("publish.stale_run", { ...stale, outcome: cls.outcome });
+          } else infra("creating the review failed", e);
         }
       }
     }
@@ -1022,7 +1151,9 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
       else audit("publish.retry_marker_skipped", { reason: "GITHUB_RUN_ID unset; the sweeper uses the label's smallest max_attempts" });
       report.actions.retry_exhausted = { ...exhausted, marker: false };
     }
-    const stickyBody = composeSticky(cls.outcome, summaryForSticky, outcomeComments, trailer);
+    // The sticky ends with this run's marker: an older run re-run later never overwrites it (runFreshness).
+    const runTag = runIdOk ? runMarker(Number(runId)) : undefined;
+    const stickyBody = composeSticky(cls.outcome, summaryForSticky, outcomeComments, [trailer, runTag].filter((t) => t !== undefined).join("\n"));
     if (report.actions.retry) report.actions.retry.marker = trailer !== undefined && stickyBody !== undefined;
     if (report.actions.retry_exhausted) report.actions.retry_exhausted.marker = trailer !== undefined && stickyBody !== undefined;
     if (stale) {
@@ -1053,7 +1184,8 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
       // one. Best effort.
       const gh = optionalApi();
       if (gh) {
-        const note = plan ? staleStickyNote(plan, cls, pr.head_sha) : runStatusStickyBody({ outcome: cls.outcome, reason: cls.reason, ...(pr.head_sha ? { head_sha: pr.head_sha } : {}) });
+        const status = plan ? staleStickyNote(plan, cls, pr.head_sha) : runStatusStickyBody({ outcome: cls.outcome, reason: cls.reason, ...(pr.head_sha ? { head_sha: pr.head_sha } : {}) });
+        const note = runTag ? `${status}\n\n${runTag}` : status;
         try {
           const existing = await gh.findStickyComment(STICKY_MARKER);
           if (existing && existing.body !== note) {
@@ -1078,6 +1210,9 @@ export async function main(args: string[], deps: PublishDeps = {}): Promise<numb
       report.actions.check = { ...check, posted: false };
       if (!pr.head_sha) {
         if (!dryRun) infra("cannot create the check run: head sha unknown");
+      } else if (unverifiedHead && !headConfirmed) {
+        // A stale run whose commit only pr.json names: it may not be this pull request's at all.
+        audit("publish.check_skipped", { reason: "the reviewed commit is not the pull request's head and the workflow passed none" });
       } else {
         const gh = getApi();
         if (gh) {

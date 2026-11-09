@@ -158,9 +158,17 @@ function lastWhitespace(s: string): number {
  * Cut `text` to at most `max` characters without splitting a surrogate pair. Prefers a whitespace
  * boundary near the end (whole tokens only); when a long token has to be split, its URL triggers
  * are defanged so a cut URL ("https://github.co") cannot become a link to a different host.
+ * A "<..." left open by the cut is dropped: a kept autolink, link destination or tag would otherwise
+ * be text (its "@" a live mention) or a tag that swallows whatever the caller appends.
  */
 export function safeCut(text: string, max: number): string {
   if (text.length <= max) return text;
+  const cut = cutHead(text, max);
+  const open = /<[A-Za-z/][^<>\n]*$/.exec(cut);
+  return open ? cut.slice(0, open.index) : cut;
+}
+
+function cutHead(text: string, max: number): string {
   const head = sliceSafe(text, Math.max(0, max));
   if (/\s/.test(text.charAt(head.length))) return head;
   const ws = lastWhitespace(head);
@@ -239,15 +247,18 @@ function naiveAuthorityHost(d: string): string | undefined {
   return m ? (m[1] ?? "").replace(/\.+$/, "") : undefined;
 }
 
-/** Percent-encode what could break out of a "<...>" destination; protect "&" from entity decoding. */
 /**
  * Percent-encode what could break out of a "<...>" destination or form block-level syntax ("[" and
- * "]": kept text must never contain "]:" / "](", or a definition could hide inside it); protect "&"
- * that would otherwise be decoded as an entity reference.
+ * "]": kept text must never contain "]:" / "](", or a definition could hide inside it); "|", which
+ * splits a GFM table cell (and the kept "<href>" with it) before inline parsing; and quotes, which
+ * open an attribute value where an HTML block reads "<href>" as a tag, swallowing what follows.
+ * "@" too: a kept "<href>" is text wherever GitHub does not parse the construct around it (an
+ * escaping backslash, an HTML block, a ```math block, $`...`$, a link nested in a link), and the
+ * mention pass never sees it. Protect "&" that would otherwise be decoded as an entity reference.
  */
 function encodeHref(h: string): string {
   return h
-    .replace(/[\s<>\\`[\]]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)
+    .replace(/[\s<>\\`[\]|'"@]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase().padStart(2, "0")}`)
     .replace(/&(?=#[0-9xX]|[A-Za-z][A-Za-z0-9]{0,31};)/g, "&amp;");
 }
 
@@ -327,7 +338,8 @@ interface Segment {
   suggestion?: boolean;
 }
 
-const FENCE_OPEN_RE = /^(`{3,}|~{3,})(.*)$/;
+/** dotAll: "." must also take U+2028/U+2029, which GitHub keeps on the opener line. */
+const FENCE_OPEN_RE = /^(`{3,}|~{3,})(.*)$/s;
 /** CommonMark closing fence: 0-3 spaces of indentation (a tab is 4 columns), spaces/tabs after. */
 const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
@@ -453,9 +465,13 @@ function segment(s: string, allowSuggestions: boolean): Segment[] {
       flush();
       const closed = j < lines.length;
       const body = lines.slice(i + 1, closed ? j : lines.length);
+      // GitHub renders a "math" block as text (mentions and references live) and decodes entities
+      // and escapes in the info string ("m&#97;th"), so such an opener becomes plain "text".
+      const rendered = /[&\\]/.test(info) || /^[ \t]*math(?:[ \t]|$)/i.test(info);
       // A redacted secret inside a committable suggestion would be committed as "[REDACTED:...]".
-      const suggestion = isSuggestionInfo(info) && allowSuggestions && !body.some((l) => l.includes("[REDACTED:"));
-      const opener = isSuggestionInfo(info) && !suggestion ? `${open}text` : line;
+      const suggestion =
+        isSuggestionInfo(info) && !rendered && allowSuggestions && !body.some((l) => l.includes("[REDACTED:"));
+      const opener = rendered || (isSuggestionInfo(info) && !suggestion) ? `${open}text` : line;
       segs.push({
         code: true,
         text: [opener, ...body, closed ? (lines[j] ?? open) : open].join("\n"),
@@ -474,7 +490,7 @@ function segment(s: string, allowSuggestions: boolean): Segment[] {
 }
 
 /** A potential fence line: indentation, a run of 3+ backticks or tildes, the rest. */
-const FENCE_LINE_RE = /^([ \t]*)(`{3,}|~{3,})(.*)$/;
+const FENCE_LINE_RE = /^([ \t]*)(`{3,}|~{3,})(.*)$/s;
 /** A list item that starts at column 0 with content on its first line; the match length is its content column. */
 const LIST_ITEM_RE = /^(?:([-+*])|(\d{1,9})[.)])( {1,4})(?=[^ \t])/;
 const THEMATIC_BREAK_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
@@ -941,9 +957,10 @@ function escapeAttr(v: string): string {
   return v.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
+/** Kept alt text; "@" gets its U+200B here because the kept tag is shown as text where it is not parsed. */
 function plainAlt(v: string): string {
-  const s = v.replace(/[\u0000-\u001F\u007F\u200B[\]]+/g, " ").replace(/\s+/g, " ").trim();
-  return s.length > 200 ? `${sliceSafe(s, 199)}\u2026` : s;
+  const s = v.replace(/[\u0000-\u001F\u007F\u200B[\]|]+/g, " ").replace(/\s+/g, " ").trim();
+  return (s.length > 200 ? `${sliceSafe(s, 199)}\u2026` : s).replace(/@/g, `@${ZWSP}`);
 }
 
 const AUTOLINK_RE = /<([A-Za-z][A-Za-z0-9+.-]{1,31}):([^\s<>]{0,2048})>/y;
@@ -958,7 +975,7 @@ function angleAt(s: string, i: number, ctx: Ctx): { text: string; end: number } 
     // Brackets are refused: kept text must never contain "]:" (a definition could hide inside).
     if ((scheme === "http" || scheme === "https") && !/[[\]]/.test(uri)) {
       const info = classifyUrl(uri, ctx.allow, false);
-      if (info.ok && info.kind === "absolute") return { text: ctx.ph.add(`<${uri}>`), end: AUTOLINK_RE.lastIndex };
+      if (info.ok && info.kind === "absolute") return { text: ctx.ph.add(`<${info.href}>`), end: AUTOLINK_RE.lastIndex };
     }
     return { text: defangUrlText(uri), end: AUTOLINK_RE.lastIndex };
   }
@@ -1011,9 +1028,12 @@ function rewriteAngles(s: string, ctx: Ctx): string {
   return out + s.slice(last);
 }
 
-/** URL extent stops: whitespace/controls, "<", placeholders, and "[" / "]" (see encodeHref). */
+/**
+ * URL extent stops: whitespace/controls, "<", placeholders, "[" / "]" and "|" (see encodeHref; a
+ * table cell boundary would otherwise cut a kept URL and expose its rest).
+ */
 function isUrlStop(c: number): boolean {
-  return c <= 32 || c === 127 || c === 60 || c === 91 || c === 93 || (c >= 0xe000 && c <= 0xe01f);
+  return c <= 32 || c === 127 || c === 60 || c === 91 || c === 93 || c === 124 || (c >= 0xe000 && c <= 0xe01f);
 }
 
 /** cmark-gfm drops trailing punctuation, unbalanced ")" and a trailing entity from autolinks. */
@@ -1027,7 +1047,7 @@ function trimAutolinkTail(t: string): string {
   let e = t.length;
   while (e > 0) {
     const c = t[e - 1] ?? "";
-    if ("?!.,:*_~'\"".includes(c)) {
+    if ("?!.,:*_~'\"\\".includes(c)) {
       e--;
       continue;
     }
@@ -1054,9 +1074,14 @@ const URL_START_RE = /([A-Za-z][A-Za-z0-9+.-]{0,31}):\/\/|www\./gi;
  * GFM extended autolinks. Matching is deliberately looser than GitHub's (any position, any scheme),
  * so everything GitHub could linkify is seen. Allowlisted http(s) URLs are protected; everything
  * else is defanged (stays readable, not clickable).
+ * A protected URL is only safe from the mention filter where GitHub really links it, which the loose
+ * match cannot promise ("awww.github.com/@user" is text, and so is any URL inside an HTML block). So
+ * one with an "@" is kept as an angle autolink with "@" encoded (see encodeHref); inside a code span
+ * it is left to the defang and mention passes (invisible there).
  */
 function rewriteBareUrls(s: string, ctx: Ctx): string {
   if (!s.includes("://") && !/www\./i.test(s)) return s;
+  const inCode = makeInCode(codeSpanRanges(s));
   let out = "";
   let last = 0;
   URL_START_RE.lastIndex = 0;
@@ -1072,15 +1097,23 @@ function rewriteBareUrls(s: string, ctx: Ctx): string {
     if (!overlong) {
       const core = trimAutolinkTail(text);
       let url: string | undefined;
+      let prefix = ""; // text before the scheme GitHub would link from ("a." in "a.https://")
       if (m[1] !== undefined) {
         const alpha = (/[A-Za-z]+$/.exec(m[1])?.[0] ?? "").toLowerCase();
+        prefix = m[1].slice(0, m[1].length - alpha.length);
         if (alpha === "http" || alpha === "https") url = alpha + core.slice(m[1].length);
       } else {
         url = `http://${core}`;
       }
       if (url !== undefined && core.length > m[0].length) {
         const info = classifyUrl(url, ctx.allow, false);
-        if (info.ok && info.kind === "absolute") replacement = ctx.ph.add(core) + text.slice(core.length);
+        if (info.ok && info.kind === "absolute") {
+          // The prefix is not part of the link: it stays visible to the defang and mention passes
+          // ("www.evil.com.https://...", "@user.https://...").
+          const tail = text.slice(core.length);
+          if (!core.includes("@")) replacement = defangUrlText(prefix) + ctx.ph.add(core.slice(prefix.length)) + tail;
+          else if (!inCode(start)) replacement = defangUrlText(prefix) + ctx.ph.add(`<${info.href}>`) + tail;
+        }
       }
     }
     out += s.slice(last, start) + (replacement ?? defangUrlText(text));
@@ -1115,9 +1148,11 @@ function neutralizeClosingRefs(s: string): string {
  * character or the start of a node before "@". Only an ASCII letter or digit right before "@" is
  * left alone (e-mail addresses): an "_" is NOT, because "_@user_" / "__@org/team__" render as
  * <em>@user</em> / <strong>@org/team</strong>, whose text node starts with "@" (the underscores are
- * emphasis delimiters, consumed by the renderer).
+ * emphasis delimiters, consumed by the renderer). An "@" right before a placeholder is broken too,
+ * since the kept text behind it is hidden from this pass. So is one behind "&name": an HTML block
+ * decodes legacy entities without ";" ("&amp@user" -> "&@user").
  */
-const MENTION_RE = /(?<![A-Za-z0-9])@(?=[A-Za-z0-9])/g;
+const MENTION_RE = /(?:(?<![A-Za-z0-9])|(?<=&[A-Za-z0-9]{1,32}))@(?=[A-Za-z0-9\uE000])/g;
 
 function sanitizeProse(s: string, ctx: Ctx): string {
   let t = dropHtmlComments(s);
@@ -1128,6 +1163,9 @@ function sanitizeProse(s: string, ctx: Ctx): string {
   t = rewriteBareUrls(t, ctx);
   t = safetyNets(t);
   t = neutralizeClosingRefs(t);
+  // A backslash would escape a kept construct's "<" (or "[", "]") and turn it into text: a kept
+  // "</details>" would no longer close, and its opener would swallow what the publisher appends.
+  t = t.replace(/\\(?=\uE000)/g, `\\${ZWSP}`);
   if (!ctx.allowMentions) t = t.replace(MENTION_RE, `@${ZWSP}`);
   return ctx.ph.restore(t);
 }

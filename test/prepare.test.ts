@@ -728,7 +728,7 @@ function writeMirrorRepo(mirror: string, repo: string, files: Record<string, str
   return sha;
 }
 
-function makeFixture(opts: { policy?: string; event?: Record<string, unknown>; orphanHead?: boolean } = {}): Fixture {
+function makeFixture(opts: { policy?: string; event?: Record<string, unknown> } = {}): Fixture {
   const dir = tmp();
   const pr = join(dir, "ws", "pr");
   mkdirSync(join(pr, "src"), { recursive: true });
@@ -738,8 +738,7 @@ function makeFixture(opts: { policy?: string; event?: Record<string, unknown>; o
   git(pr, "add", "-A");
   git(pr, "commit", "-q", "-m", "base");
   const base = git(pr, "rev-parse", "HEAD");
-  if (opts.orphanHead) git(pr, "checkout", "-q", "--orphan", "feature");
-  else git(pr, "checkout", "-q", "-b", "feature");
+  git(pr, "checkout", "-q", "-b", "feature");
   writeFileSync(join(pr, "src", "checkout.ts"), 'import { createOrder } from "@acme/api";\nexport const go = (c) => createOrder(c.id, c.items);\n');
   mkdirSync(join(pr, "__snapshots__"), { recursive: true });
   writeFileSync(join(pr, "__snapshots__", "a.snap"), "snap\n");
@@ -991,13 +990,154 @@ describe("main: skips, refusals and fallbacks", () => {
     expect(await main([...args(f, join(f.dir, "w")), "--repo", "evil/web"], { env: BASE_ENV, stdout: quiet, stderr: quiet })).toBe(1);
     expect(await main([...args(f, join(f.dir, "w")), "--pr", "43"], { env: BASE_ENV, stdout: quiet, stderr: quiet })).toBe(1);
     expect(await main([...args(f, join(f.dir, "w")), "--head-sha=-upload-pack"], { env: BASE_ENV, stdout: quiet, stderr: quiet })).toBe(1);
+    // An abbreviated sha would write a pr.json that readContext (MCP servers, publisher) rejects.
+    expect(await main([...args(f, join(f.dir, "w")), `--head-sha=${f.head.slice(0, 12)}`], { env: BASE_ENV, stdout: quiet, stderr: quiet })).toBe(1);
   });
 
-  it("falls back to a two-dot diff when there is no merge base", async () => {
-    const f = makeFixture({ orphanHead: true });
-    const stdout = capture();
-    expect(await main(args(f, join(f.dir, "work")), { env: BASE_ENV, stdout, stderr: quiet })).toBe(0);
-    expect(JSON.parse(stdout.text()).diff_method).toBe("two-dot");
+  it("never falls back to a two-dot diff: with no merge base locally it uses the GitHub API diff", async () => {
+    // Shallow fetch of base and head: both commits exist but their merge base is not reachable.
+    const dir = tmp();
+    const src = join(dir, "src");
+    mkdirSync(src);
+    git(src, "init", "-q", "-b", "main");
+    writeFileSync(join(src, "a.txt"), "a\n");
+    git(src, "add", "-A");
+    git(src, "commit", "-q", "-m", "root");
+    git(src, "checkout", "-q", "-b", "feature");
+    writeFileSync(join(src, "new.txt"), "new\n");
+    git(src, "add", "-A");
+    git(src, "commit", "-q", "-m", "pr");
+    git(src, "checkout", "-q", "main");
+    writeFileSync(join(src, "base-only.txt"), "base\n");
+    git(src, "add", "-A");
+    git(src, "commit", "-q", "-m", "base moves on");
+    const pr = join(dir, "pr");
+    execFileSync("git", ["clone", "-q", "--depth=1", "--branch", "main", `file://${src}`, pr]);
+    git(pr, "fetch", "-q", "--depth=1", "origin", "feature");
+    const base = git(pr, "rev-parse", "HEAD");
+    const head = git(pr, "rev-parse", "FETCH_HEAD");
+    // Control: the two-dot diff reverts the base-only commit.
+    expect(git(pr, "diff", "--name-status", base, head)).toBe("D\tbase-only.txt\nA\tnew.txt");
+
+    const apiDiff = ["diff --git a/new.txt b/new.txt", "new file mode 100644", "index 0000000..3e75765", "--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+new", ""].join("\n");
+    const fetchImpl = (async () => new Response(apiDiff, { status: 200 })) as unknown as typeof fetch;
+    const diff = await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: { GITHUB_TOKEN: "t" }, fetchImpl });
+    expect(diff).toEqual({ text: apiDiff, method: "api", attributes: "github" });
+    // Without a token prepare fails rather than serve a wrong diff.
+    await expect(computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: {} })).rejects.toThrow(/shallow checkout.*no GITHUB_TOKEN/);
+    // Same on git < 2.40 (isolated diff).
+    const old = await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: { GITHUB_TOKEN: "t" }, fetchImpl, git: oldGitShim() });
+    expect(old.method).toBe("api");
+
+    // The full repository (where main also moved on) gets the merge-base diff locally: only new.txt.
+    const files = (d: { text: string }) => [...d.text.matchAll(/^diff --git a\/(\S+)/gm)].map((m) => m[1]);
+    for (const shim of [undefined, oldGitShim()]) {
+      const full = await computeDiff({ prDir: src, base, head, repo: "acme/web", pr: 1, env: {}, git: shim });
+      expect(full.method).toBe("three-dot");
+      expect(files(full)).toEqual(["new.txt"]);
+    }
+  });
+
+  it("does not trust a merge base git finds on shallow history: it uses the GitHub API diff", async () => {
+    // main: X-c1-c2-c3-c4-c5-c6 (c6 merges g1, a child of X); feature: X-f1, f2 = merge(f1, c3),
+    // f3 deletes main1.txt. The real merge base is c3; a reused workspace that fetched an earlier
+    // PR (on c6) and then this one, both --depth=4, finds X instead.
+    const dir = tmp();
+    const src = join(dir, "src");
+    mkdirSync(src);
+    const commit = (msg: string): void => {
+      git(src, "add", "-A");
+      git(src, "commit", "-q", "-m", msg);
+    };
+    git(src, "init", "-q", "-b", "main");
+    writeFileSync(join(src, "x.txt"), "x\n");
+    commit("X");
+    git(src, "branch", "g");
+    git(src, "branch", "feature");
+    for (const i of [1, 2, 3]) {
+      writeFileSync(join(src, `main${i}.txt`), `m${i}\n`);
+      commit(`c${i}`);
+    }
+    git(src, "checkout", "-q", "g");
+    writeFileSync(join(src, "g.txt"), "g\n");
+    commit("g1");
+    git(src, "checkout", "-q", "main");
+    for (const i of [4, 5]) {
+      writeFileSync(join(src, `main${i}.txt`), `m${i}\n`);
+      commit(`c${i}`);
+    }
+    git(src, "merge", "-q", "--no-ff", "-m", "c6", "g");
+    git(src, "checkout", "-q", "-b", "earlier");
+    writeFileSync(join(src, "other.txt"), "o\n");
+    commit("o1");
+    git(src, "checkout", "-q", "feature");
+    writeFileSync(join(src, "feat.txt"), "f\n");
+    commit("f1");
+    git(src, "merge", "-q", "--no-ff", "-m", "f2", "main~3");
+    git(src, "rm", "-q", "main1.txt");
+    commit("f3");
+    const base = git(src, "rev-parse", "main");
+    const head = git(src, "rev-parse", "feature");
+    expect(git(src, "diff", "--name-status", `${base}...${head}`)).toBe("A\tfeat.txt\nD\tmain1.txt");
+    const pr = join(dir, "pr");
+    mkdirSync(pr);
+    git(pr, "init", "-q");
+    git(pr, "fetch", "-q", "--depth=4", `file://${src}`, "earlier");
+    git(pr, "fetch", "-q", "--depth=4", `file://${src}`, "feature");
+    // Control: locally the three-dot diff succeeds, hides the deletion and adds base-only files.
+    expect(git(pr, "diff", "--name-status", `${base}...${head}`)).toBe("A\tfeat.txt\nA\tmain2.txt\nA\tmain3.txt");
+
+    const apiDiff = ["diff --git a/feat.txt b/feat.txt", "new file mode 100644", "index 0000000..6a69f92", "--- /dev/null", "+++ b/feat.txt", "@@ -0,0 +1 @@", "+f", ""].join("\n");
+    const fetchImpl = (async () => new Response(apiDiff, { status: 200 })) as unknown as typeof fetch;
+    expect(await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: { GITHUB_TOKEN: "t" }, fetchImpl })).toEqual({ text: apiDiff, method: "api", attributes: "github" });
+    await expect(computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: {} })).rejects.toThrow(/shallow checkout.*no GITHUB_TOKEN/);
+    const old = await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: { GITHUB_TOKEN: "t" }, fetchImpl, git: oldGitShim() });
+    expect(old.method).toBe("api");
+
+    // A failing shallow probe counts as shallow even on the full repository, and the error is git's own.
+    const probeFails = join(tmp("xrepo-noprobe-"), "git");
+    writeFileSync(
+      probeFails,
+      [
+        "#!/bin/sh",
+        'for a in "$@"; do',
+        '  case "$a" in --is-shallow-repository) echo "fatal: detected dubious ownership in repository" >&2; exit 128;; esac',
+        "done",
+        `exec '${findGit()}' "$@"`,
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    expect((await computeDiff({ prDir: src, base, head, repo: "acme/web", pr: 1, env: { GITHUB_TOKEN: "t" }, fetchImpl, git: probeFails })).method).toBe("api");
+    await expect(computeDiff({ prDir: src, base, head, repo: "acme/web", pr: 1, env: {}, git: probeFails })).rejects.toThrow(
+      "cannot compute the PR diff: git rev-parse --is-shallow-repository: fatal: detected dubious ownership in repository; no GITHUB_TOKEN",
+    );
+  });
+
+  it("uses the local diff in a shallow checkout when base is a visible ancestor of head", async () => {
+    const dir = tmp();
+    const src = join(dir, "src");
+    mkdirSync(src);
+    git(src, "init", "-q", "-b", "main");
+    writeFileSync(join(src, "a.txt"), "a\n");
+    git(src, "add", "-A");
+    git(src, "commit", "-q", "-m", "root");
+    git(src, "checkout", "-q", "-b", "feature");
+    for (const n of ["n1", "n2"]) {
+      writeFileSync(join(src, `${n}.txt`), `${n}\n`);
+      git(src, "add", "-A");
+      git(src, "commit", "-q", "-m", n);
+    }
+    const pr = join(dir, "pr");
+    execFileSync("git", ["clone", "-q", "--depth=1", "--branch", "main", `file://${src}`, pr]);
+    git(pr, "fetch", "-q", "--depth=3", "origin", "feature");
+    expect(git(pr, "rev-parse", "--is-shallow-repository")).toBe("true");
+    const base = git(pr, "rev-parse", "HEAD");
+    const head = git(pr, "rev-parse", "FETCH_HEAD");
+    const diff = await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: {} });
+    expect(diff.method).toBe("three-dot");
+    expect([...diff.text.matchAll(/^diff --git a\/(\S+)/gm)].map((m) => m[1])).toEqual(["n1.txt", "n2.txt"]);
+    expect((await computeDiff({ prDir: pr, base, head, repo: "acme/web", pr: 1, env: {}, git: oldGitShim() })).method).toBe("three-dot");
   });
 
   it("falls back to the GitHub API diff when the base commit is missing", async () => {
@@ -1076,7 +1216,7 @@ function oldGitShim(): string {
 }
 
 /** Base: app.js + a real binary. Head: `.gitattributes: * -diff`, 500 new lines in app.js, binary changed. */
-function hidingFixture(opts: { orphanHead?: boolean } = {}): { dir: string; pr: string; base: string; head: string } {
+function hidingFixture(): { dir: string; pr: string; base: string; head: string } {
   const dir = tmp();
   const pr = join(dir, "pr");
   mkdirSync(pr);
@@ -1086,7 +1226,7 @@ function hidingFixture(opts: { orphanHead?: boolean } = {}): { dir: string; pr: 
   git(pr, "add", "-A");
   git(pr, "commit", "-q", "-m", "base");
   const base = git(pr, "rev-parse", "HEAD");
-  git(pr, "checkout", "-q", opts.orphanHead ? "--orphan" : "-b", "feature");
+  git(pr, "checkout", "-q", "-b", "feature");
   writeFileSync(join(pr, ".gitattributes"), "* -diff\n");
   writeFileSync(join(pr, "app.js"), `start();\n${Array.from({ length: 500 }, (_, i) => `exfiltrate(${i});`).join("\n")}\n`);
   writeFileSync(join(pr, "logo.bin"), Buffer.from([0x89, 0, 1, 2, 0, 4]));
@@ -1121,11 +1261,6 @@ describe("computeDiff: gitattributes never come from the PR", () => {
     expect(fileStats(diff.text)).toEqual(VISIBLE);
     expect(diff.text).toContain("+exfiltrate(499);");
     expect(diff.text).not.toContain("Binary files a/app.js");
-    // No merge base: the two-dot retry is isolated too.
-    const o = hidingFixture({ orphanHead: true });
-    const two = await computeDiff({ prDir: o.pr, base: o.base, head: o.head, repo: "acme/web", pr: 1, git: shim });
-    expect(two).toMatchObject({ method: "two-dot", attributes: "none" });
-    expect(fileStats(two.text)).toEqual(VISIBLE);
     // The temporary work tree is removed and the PR checkout is untouched.
     expect(noattrDirs().filter((n) => !before.has(n))).toEqual([]);
     expect(git(f.pr, "status", "--porcelain")).toBe("");
@@ -1465,7 +1600,7 @@ describe("regression: the runner's git config cannot change the diff (git-diff-i
     expect(configured.text.match(/^@@ .*$/gm)).toEqual(["@@ -1,7 +1,7 @@", "@@ -9,7 +9,7 @@ line 8", "@@ -1,5 +1,5 @@"]);
     expect(configured.text).toContain("diff --git a/a.txt b/a.txt");
     expect(configured.text).toContain("\n x\n \n-y\n+Y\n \n z\n");
-    expect(gitDiffArgs(base, head, true, true)).toEqual(expect.arrayContaining(["--inter-hunk-context=0", "--diff-algorithm=myers", "-O/dev/null", "core.bigFileThreshold=512m"]));
+    expect(gitDiffArgs(base, head, true)).toEqual(expect.arrayContaining(["--inter-hunk-context=0", "--diff-algorithm=myers", "-O/dev/null", "core.bigFileThreshold=512m"]));
   });
 });
 

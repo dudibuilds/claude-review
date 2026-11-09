@@ -44,9 +44,22 @@ export const DEFAULT_DENY_GLOBS = [
   "**/.npmrc",
   "**/.pypirc",
   "**/.netrc",
+  "**/.git-credentials",
+  "**/.aws/credentials",
+  "**/.docker/config.json",
+  "**/.kube/config",
+  "**/*kubeconfig*.{yaml,yml}",
+  "**/*.kubeconfig",
+  "**/*.jks",
+  "**/*.keystore",
+  "**/*.ppk",
   "**/secrets/**",
   "**/*.tfstate",
   "**/*.tfstate.*",
+  "**/terraform.tfvars",
+  "**/terraform.tfvars.json",
+  "**/*.auto.tfvars",
+  "**/*.auto.tfvars.json",
 ];
 
 export const DEFAULT_EXCLUDE_GLOBS = [

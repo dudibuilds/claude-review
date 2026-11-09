@@ -2,7 +2,7 @@
  * Outcome classification (SPEC "Outcomes"): decides what a review run ended in, from the prepare
  * skip decision, the claude-code-action step outcome, the action's execution file and the draft.
  *
- * Order: skipped -> usage_limit -> completed -> incomplete -> error.
+ * Order: skipped -> completed -> usage_limit -> incomplete -> error.
  *
  * Execution file (claude-code-action@v1 `execution_file`): a pretty-printed JSON array of raw SDK
  * messages whose last element is the `result` message. JSON lines, truncated files (we read only the
@@ -70,15 +70,16 @@ export const USAGE_LIMIT_PATTERNS: readonly RegExp[] = [
   /\byour usage allocation has been disabled/i,
   /\byour group(?:'|\u2019)?s usage limit\b/i,
   /\brequires usage credits\b/i,
-  /\busage[ _-]limit/i,
-  /\blimit reached\b/i,
-  /\b(?:session|weekly|daily|monthly|opus|sonnet|fable|5-hour) limit\b/i,
-  /\brate[ _-]?limit/i,
+  // Whole phrases only: a bare 429 / quota / overloaded / rate limit / usage limit also appears in
+  // paths, identifiers and messages ("src/quota/limits.ts line 429 not found") of other failures.
+  /\busage limit reached\b/i,
+  /\breached your specified API usage limits\b/i,
+  /\b(?:session|weekly) limit reached\b/i,
+  /\brate limit(?:ed| exceeded| reached| rejected)\b(?![/_-])/i,
   /\btoo many requests\b/i,
-  /\b429\b/,
-  /\b529\b/,
-  /\bquota\b/i,
-  /\boverloaded\b/i,
+  /\bAPI Error: (?:429\b|529\b|Request rejected \(429\))/i,
+  /\b529 overloaded\b/i,
+  /"overloaded_error"/, // the API's JSON error type, quoted so a file name does not match
   /\bcredit balance is too low\b/i,
 ];
 
@@ -473,6 +474,10 @@ export function classifyOutcome(input: ClassifyInput): Classification {
   }
   const succeeded = result !== undefined && result.subtype === "success" && result.is_error !== true;
 
+  // finish() was called: the review is done, whatever failed after it (e.g. a trailing 529).
+  const draft = input.draft;
+  if (draft?.finished) return { outcome: "completed", reason: "review finished" };
+
   if (!succeeded && msgs.length > 0) {
     const ev = usageLimitEvidence(msgs, result);
     if (ev) {
@@ -480,9 +485,6 @@ export function classifyOutcome(input: ClassifyInput): Classification {
       return { outcome: "usage_limit", reason, ...(ev.reset ? { reset_at: ev.reset } : {}) };
     }
   }
-
-  const draft = input.draft;
-  if (draft?.finished) return { outcome: "completed", reason: "review finished" };
 
   const subtype = str(result?.subtype);
   if (draftHasEntries(draft) || subtype === "error_max_turns") {

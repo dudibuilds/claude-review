@@ -107,6 +107,64 @@ describe("redactSecrets: true positives", () => {
     }
   });
 
+  it("more well-known token formats", () => {
+    const cases: [string, string][] = [
+      ["glpat-" + rep("aB3dE", 4), "gitlab_token"],
+      ["npm_" + rep("aB3d", 9), "npm_token"],
+      ["SG." + rep("aB3dE6", 3) + "abcd" + "." + rep("aB3dE6", 7) + "x", "sendgrid_key"],
+      ["sk_" + "test_" + "4eC39HqLyjWDarjtT1zdp7dc", "stripe_key"],
+      ["whsec_" + rep("aB3d", 8), "stripe_key"],
+      ["xoxe-1-" + rep("aB3d", 10), "slack_token"],
+      ["hf_" + rep("abcDEFghiJ", 3) + "klmN", "huggingface_token"],
+      ["ya29." + rep("a0AfH6SM", 4), "google_oauth_token"],
+      ["ya29." + rep("a0AfH6SM", 4) + "." + rep("xY9z", 5), "google_oauth_token"],
+      ["ya29.c." + rep("b0AXv0zT", 4), "google_oauth_token"],
+    ];
+    for (const [secret, kind] of cases) {
+      expect(redactSecrets(`key: ${secret} # x`).text, secret).toBe(`key: [REDACTED:${kind}] # x`);
+    }
+  });
+
+  it("credentials in connection strings, auth headers and URLs keep their context", () => {
+    const azureKey = rep("aB3d+/9Z", 11);
+    const cases: [string, string][] = [
+      [`AccountName=x;AccountKey=${azureKey};EndpointSuffix=core`, "AccountName=x;AccountKey=[REDACTED:azure_key];EndpointSuffix=core"],
+      [`Endpoint=sb://x/;SharedAccessKeyName=root;SharedAccessKey=${azureKey}`, "Endpoint=sb://x/;SharedAccessKeyName=root;SharedAccessKey=[REDACTED:azure_key]"],
+      [`curl -H "Authorization: Basic dXNlcjpwYXNzd29yZDEyMw==" x`, `curl -H "Authorization: Basic [REDACTED:basic_auth]" x`],
+      [`headers = {"Authorization": "Basic YWRtaW46czNjcjN0"}`, `headers = {"Authorization": "Basic [REDACTED:basic_auth]"}`],
+      [`xhr.setRequestHeader("Authorization", "Basic YWRtaW46czNjcjN0");`, `xhr.setRequestHeader("Authorization", "Basic [REDACTED:basic_auth]");`],
+      [`'Authorization' => 'Basic YWRtaW46czNjcjN0',`, `'Authorization' => 'Basic [REDACTED:basic_auth]',`],
+      [`proxy_set_header Authorization "Basic YWRtaW46czNjcjN0";`, `proxy_set_header Authorization "Basic [REDACTED:basic_auth]";`],
+      [`headers["Authorization"] = "Basic YWRtaW46czNjcjN0"`, `headers["Authorization"] = "Basic [REDACTED:basic_auth]"`],
+      [`http.Header{"Authorization": {"Basic YWRtaW46czNjcjN0"}}`, `http.Header{"Authorization": {"Basic [REDACTED:basic_auth]"}}`],
+      ["const AUTH = `Basic YWRtaW46czNjcjN0`;", "const AUTH = `Basic [REDACTED:basic_auth]`;"],
+      [`git clone https://${rep("0a1b2c3d4e", 4)}@github.com/o/r`, "git clone https://[REDACTED:url_credentials]@github.com/o/r"],
+      [`Authorization: Bearer ${rep("abcdefGHIJ", 4)}`, "Authorization: Bearer [REDACTED:bearer_token]"],
+      [`Authorization: Bearer abc_def-ghi_${rep("Xy9", 7)}`, "Authorization: Bearer [REDACTED:bearer_token]"],
+      // A token with a digit is redacted even when it reads like an UPPER_SNAKE name.
+      ["Authorization: Bearer AB12CD34_EF56GH78_IJ90KL12", "Authorization: Bearer [REDACTED:bearer_token]"],
+    ];
+    for (const [input, expected] of cases) expect(redactSecrets(input).text, input).toBe(expected);
+  });
+
+  it("unquoted env-file assignments keep the key", () => {
+    const cases: [string, string][] = [
+      ["DB_PASSWORD=hunter2hunter2", "DB_PASSWORD=[REDACTED:secret_assignment]"],
+      ["export GITLAB_API_TOKEN=Zq3xWv8tYu # ci", "export GITLAB_API_TOKEN=[REDACTED:secret_assignment] # ci"],
+      ["ENV JWT_SECRET=supersecretvalue", "ENV JWT_SECRET=[REDACTED:secret_assignment]"],
+      ["      - CLIENT_SECRET=abcDEF123ghi\r", "      - CLIENT_SECRET=[REDACTED:secret_assignment]\r"],
+      ["SECRET_KEY=django-insecure-0123456789abcdef", "SECRET_KEY=[REDACTED:secret_assignment]"],
+      ["MINIO_SECRET_KEY=0123456789abcdef0123", "MINIO_SECRET_KEY=[REDACTED:secret_assignment]"],
+      ["aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "aws_secret_access_key = [REDACTED:aws_secret_key]"],
+      ['password = "Qw3r!ty://x"', 'password = "[REDACTED:secret_assignment]"'],
+    ];
+    for (const [input, expected] of cases) {
+      const r = redactSecrets(input);
+      expect(r.text, input).toBe(expected);
+      expect(r.count, input).toBe(1);
+    }
+  });
+
   it("counts every secret and is idempotent", () => {
     const text = [`a=${GH_PAT}`, `b=${AWS_ID}`, `c = "${OPENAI}"`, PEM, `password: "Sup3rS3cret!"`].join("\n");
     const r = redactSecrets(text);
@@ -147,6 +205,63 @@ describe("redactSecrets: false positives", () => {
     "eyJhbGciOi without dots",
     "-----BEGIN CERTIFICATE-----",
     "xoxb-short",
+    // Ordinary code and config next to the newer rules.
+    "password = getPassword()",
+    "const password = await vault.read('db/password')",
+    "  password: null",
+    "  password: string",
+    "  token: AccessToken",
+    "  password: process.env.DB_PASSWORD",
+    "  password: form.password1",
+    "    secretAccessKey: process.env.R2_SECRET_ACCESS_KEY!",
+    "  token: session?.oauth2?.accessToken",
+    "  password: *db_password_ref2",
+    "  secret: my-app-secret-2",
+    "  token: newToken2,",
+    // Unquoted YAML values are not redacted (the deny globs cover config files), so type
+    // annotations and names are left alone.
+    "  token: ERC721Token!",
+    "  privateKey: Bytes32!",
+    "  privateKey: P256.Signing.PrivateKey?",
+    "  timeout: 30000000\n  password: 12345678",
+    "  publicKey: Uint8Array\n  privateKey: Uint8Array",
+    "    private_key: Ed25519PrivateKey",
+    "  secret: Uint8Array",
+    "  accessToken: AccessTokenV2",
+    "  existingSecret: postgresql2",
+    "  password: hunter2hunter2",
+    "SECRET_KEY=${DJANGO_SECRET_KEY}",
+    "SECRET_KEY_PATH=/run/secrets/django2",
+    "  password: config.get(name1)",
+    "    password: Optional[Secret1]",
+    "  api_key: ${API_KEY_V2}",
+    "PASSWORD=${DB_PASSWORD}",
+    "GITHUB_TOKEN=$(gh auth token)",
+    "TOKEN_PATH=/var/run/secrets/token",
+    "PASSWORD_FILE=/run/secrets/db",
+    "SECRET_NAME=prod-db-secret-2",
+    "MAX_TOKENS=4096",
+    "API_TOKEN=REPLACE_ME_WITH_TOKEN",
+    "    password=password",
+    "password = os.environ['DB_PASSWORD']",
+    "const TOKEN=getToken()",
+    "url: https://registry.npmjs.org/npm_" + "config",
+    "ssh://git@github.com/acme/web.git",
+    "https://user@example.com/path",
+    "https://abcdefghijklmnopqrstuvwxyz@example.com",
+    "Authorization: Basic ${btoa(user + ':' + pass)}",
+    "Authorization: Basic authentication",
+    "Basic configuration options",
+    `xhr.setRequestHeader("Authorization", "Basic " + encoded);`,
+    "proxy_set_header Authorization $http_authorization;",
+    "Authorization: Bearer ${accessToken}",
+    "Authorization: Bearer YOUR_ACCESS_TOKEN_GOES_HERE_NOW",
+    "Bearer accessTokenFromEnv",
+    "AccountKey=<storage-account-key>",
+    "hf_loadPretrainedModel",
+    "const sk_test_mode = true",
+    "SG.setApiKey(process.env.SENDGRID_API_KEY)",
+    "  tokenUrl: https://oauth2.googleapis.com/token",
   ];
   for (const line of benign) {
     it(JSON.stringify(line), () => {
@@ -201,6 +316,18 @@ describe("redactSecrets: performance (linear time)", () => {
       "ghp_".repeat(n / 4),
       "AKIA".repeat(n / 4),
       "a".repeat(n),
+      "DB_PASSWORD=" + "a".repeat(n),
+      "DB_PASSWORD=x\n".repeat(n / 14),
+      "  password: " + "a1".repeat(n / 2) + " x",
+      "password: a1\n".repeat(n / 13),
+      ("A".repeat(39) + "\n").repeat(n / 40),
+      "aws_secret_access_key=".repeat(n / 22),
+      "Authorization: Basic ".repeat(n / 21),
+      "Basic ".repeat(n / 6),
+      "Basic " + "A".repeat(n),
+      "https://" + "a1".repeat(n / 2),
+      "AccountKey=" + "A".repeat(n),
+      "ya29.".repeat(n / 5),
     ];
     for (const input of inputs) {
       expect(time(input), input.slice(0, 30)).toBeLessThan(2000);

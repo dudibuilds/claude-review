@@ -831,6 +831,38 @@ describe("removal", () => {
     expect(existsSync(repoDir)).toBe(false);
   });
 
+  // Regression: GitHub names are case-insensitive. After "csr/api" became "CsR/API" (policy edit) or
+  // "CSR/Api" (owner/* listing), sync wrote into the existing directory on a case-insensitive
+  // filesystem and then retired it as unlisted; on a case-sensitive one it cloned a second copy.
+  it("keeps one directory per repo, never retired, when the desired spelling changes case", async () => {
+    const sha = makeRepo("csr/api");
+    for (const spelling of ["CsR/API", "CSR/Api"]) {
+      // The file:// remote must resolve under every spelling on a case-sensitive filesystem too.
+      if (!existsSync(bareDir(spelling))) {
+        mkdirSync(dirname(bareDir(spelling)), { recursive: true });
+        symlinkSync(bareDir("csr/api"), bareDir(spelling));
+      }
+    }
+    const mirror = newMirror();
+    const base = { mirrorDir: mirror, urlTemplate: template, snapshotGraceMs: 0 };
+    await syncMirror({ ...base, policy: policyOf("repos: [csr/api]"), github: quietGithub });
+    const listing: GithubApi = { listOwnerRepos: async () => [{ full_name: "CSR/Api" }] };
+    for (const [policy, github, repo] of [
+      [policyOf("repos: [CsR/API]"), quietGithub, "CsR/API"],
+      [policyOf('repos: ["csr/*"]'), listing, "CSR/Api"],
+    ] as const) {
+      for (let i = 0; i < 2; i++) {
+        const r = await syncMirror({ ...base, policy, github });
+        expect(r).toMatchObject({ removed: [], retired: [], failed: 0 });
+        expect(resultFor(r, repo)).toMatchObject({ action: "unchanged", sha });
+        expect(readdirSync(mirror)).toEqual(["csr"]);
+        expect(readdirSync(join(mirror, "csr"))).toEqual(["api"]);
+        expect(existsSync(join(mirror, "csr/api", RETIRED_FILE))).toBe(false);
+        expect(discoverMirror(mirror).map((e) => [e.repo, e.sha])).toEqual([["csr/api", sha]]);
+      }
+    }
+  });
+
   it("still refuses to delete a retired-looking directory that holds anything sync does not create", async () => {
     makeRepo("grs/api");
     makeRepo("grs/web");

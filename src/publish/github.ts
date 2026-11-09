@@ -20,9 +20,11 @@
  * identity authored. createReview can then post the same review as a COMMENT instead
  * (`downgradeRefusedEvent`), so the inline comments are not lost; the result says so, and the
  * caller must not treat the review as approving or blocking. With `downgradeRefusedEvent` (or
- * `verifyHead`) an APPROVE is also only submitted while the commit it reviewed is still the pull
- * request's head (GET the pull request first): a re-run of an older workflow run must not approve
- * the current head. Both a REQUEST_CHANGES and an APPROVE review stay in force until they are
+ * `verifyHead`) no review is posted unless the commit it reviewed is still the pull request's head
+ * (GET the pull request first; a moved head throws StaleHeadError): a re-run of an older workflow
+ * run, or a push while this run published, must not review the old commit; a pull request that
+ * cannot be read gets no review of any event either. An APPROVE is also withheld (posted as a
+ * COMMENT) when the pull request is not open or the caller says so (`withholdApproval`). Both a REQUEST_CHANGES and an APPROVE review stay in force until they are
  * dismissed (a later COMMENT review clears neither, and an approval keeps counting across pushes
  * unless branch protection dismisses stale approvals):
  *   - dismissStaleChangeRequests (a finished run that does not request changes via a review)
@@ -36,7 +38,9 @@
  *
  * Replayed runs (re-running an older workflow run): runFreshness() tells the caller whether this
  * run still reviews the pull request's head and, with `run`, whether a newer workflow run already
- * posted a check for that commit. With `run`, every check run carries the run id in external_id and
+ * published: a check for that commit, or our sticky comment / a review of ours that ends with a newer
+ * run's marker (runMarker; the caller ends the sticky with it, createReview adds it to every review
+ * body). With `run`, every check run carries the run id in external_id and
  * createCheckRun never posts over a check run of a newer workflow run for the same commit; with
  * `keep_failure`, a passing conclusion is not posted over a failing one (for runs that did not
  * review the commit: skips, errors, usage limits).
@@ -46,6 +50,8 @@ import { audit } from "../common/audit.js";
 import {
   extractCommentKeys,
   isXrepoReviewBody,
+  REVIEW_MARKER,
+  STICKY_MARKER,
   type CheckRunConclusion,
   type PlanCheck,
   type PlanComment,
@@ -83,12 +89,36 @@ export interface CreateReviewOptions {
    */
   downgradeRefusedEvent?: boolean;
   /**
-   * Before submitting an APPROVE, GET the pull request and only approve while its head is still the
-   * commit this client reviews (headSha) and it is open. Otherwise the review is posted as a COMMENT
+   * Before submitting any review, GET the pull request: when its head is no longer the commit this
+   * client reviews (headSha), nothing is posted and StaleHeadError is thrown. An APPROVE is also
+   * only submitted while the pull request is open; otherwise it is posted as a COMMENT
    * (`downgraded`, like a refused event) with `downgradeRefusedEvent`, or the call throws. Default:
-   * the value of `downgradeRefusedEvent`. A failed GET withholds the approval (fail closed).
+   * the value of `downgradeRefusedEvent`. A failed GET posts nothing and throws, whatever the event
+   * (fail closed).
    */
   verifyHead?: boolean;
+  /** Withhold an APPROVE for this reason (the caller's own gates), exactly like a closed pull request. */
+  withholdApproval?: string;
+}
+
+/** createReview posted nothing: the commit it reviewed is no longer the pull request's head. */
+export class StaleHeadError extends Error {
+  constructor(
+    message: string,
+    /** The pull request's current head. */
+    readonly head_sha: string,
+  ) {
+    super(message);
+    this.name = "StaleHeadError";
+  }
+}
+
+/** A changed file as GitHub lists it (GET /repos/{owner}/{repo}/pulls/{number}/files). */
+export interface PullRequestFile {
+  path: string;
+  previous_path?: string;
+  additions: number;
+  deletions: number;
 }
 
 export interface DismissResult {
@@ -175,10 +205,16 @@ export interface GitHubApi {
   /** The pull request as GitHub reports it now. */
   getPullRequest?(): Promise<PullRequestState>;
   /**
+   * The pull request's changed files as GitHub lists them. Throws when the list is incomplete
+   * (GitHub lists at most 3000 files).
+   */
+  listPullRequestFiles?(): Promise<PullRequestFile[]>;
+  /**
    * Is this run still current? False when the pull request head is no longer headSha (a re-run of
-   * an older workflow run, or a push while this run was publishing), or, with `run` and a check
-   * name, when a newer workflow run already posted that check for headSha. Throws when the pull
-   * request cannot be read.
+   * an older workflow run, or a push while this run was publishing), or, with `run`, when a newer
+   * workflow run already published: its check (`checkName`) on headSha, or its marker (runMarker)
+   * at the end of our sticky comment or one of our reviews. Throws when the pull request cannot be
+   * read.
    */
   runFreshness?(checkName?: string): Promise<RunFreshness>;
   /** Completed check run (head_sha defaults to the configured headSha). */
@@ -227,6 +263,27 @@ export function runIdFromExternalId(externalId: string | null | undefined): numb
   const id = m ? Number(m[1]) : NaN;
   return Number.isSafeInteger(id) ? id : undefined;
 }
+
+/**
+ * Hidden marker naming the workflow run that published a sticky comment or review. Only read at the
+ * very end of a body (runIdFromMarker), where sanitized agent text can never be: the sticky ends
+ * with it, a review body ends with it followed by REVIEW_MARKER.
+ */
+export function runMarker(runId: number): string {
+  return `<!-- xrepo-review:run=${runId} -->`;
+}
+
+const RUN_MARKER_END_RE = /<!-- xrepo-review:run=(\d{1,20}) -->(?:\r?\n<!-- xrepo-review:review -->)?\s*$/;
+
+/** The workflow run id in the marker that ends `body` (undefined when there is none). */
+export function runIdFromMarker(body: string | null | undefined): number | undefined {
+  const m = RUN_MARKER_END_RE.exec(typeof body === "string" ? body : "");
+  const id = m ? Number(m[1]) : NaN;
+  return Number.isSafeInteger(id) ? id : undefined;
+}
+
+/** GitHub's pull request files endpoint lists at most this many files. */
+const MAX_LISTED_FILES = 3000;
 
 const PASSING_CHECK = new Set<CheckRunConclusion>(["success", "neutral", "skipped"]);
 
@@ -386,13 +443,9 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
   /** Reviews this client posted (id -> accepted event): never dismissed as "earlier" ones. */
   const posted = new Map<number, ReviewEvent>();
   const short = (sha: string): string => (sha === "" ? "(unknown)" : sha.slice(0, 7));
-  /** Is `sha` the commit this client reviews (headSha, or headSha abbreviated to >= 7 characters)? */
-  const isOurHead = (sha: string | null | undefined): boolean => {
-    if (typeof sha !== "string" || sha === "" || headSha === "") return false;
-    const a = sha.toLowerCase();
-    const b = headSha.toLowerCase();
-    return a === b || (b.length >= 7 && a.startsWith(b));
-  };
+  /** Is `sha` the commit this client reviews (headSha, compared in full)? */
+  const isOurHead = (sha: string | null | undefined): boolean =>
+    typeof sha === "string" && sha !== "" && headSha !== "" && sha.toLowerCase() === headSha.toLowerCase();
 
   const getPullRequest = async (): Promise<PullRequestState> => {
     const r = await octokit.rest.pulls.get({ owner, repo, pull_number: prNumber });
@@ -406,6 +459,8 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
     id: number;
     state: string;
     commit_id?: string;
+    /** The workflow run that posted it (runIdFromMarker). */
+    run?: number;
   }
   /** Reviews by our identity that this tool posted (REVIEW_MARKER or the legacy framing). */
   const listOurReviews = async (): Promise<OurReview[]> => {
@@ -420,7 +475,8 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
     })) {
       for (const rv of page.data) {
         if (!isSelf(self, rv.user) || !isXrepoReviewBody(rv.body)) continue;
-        out.push({ id: rv.id, state: rv.state, ...(typeof rv.commit_id === "string" ? { commit_id: rv.commit_id } : {}) });
+        const run = runIdFromMarker(rv.body);
+        out.push({ id: rv.id, state: rv.state, ...(typeof rv.commit_id === "string" ? { commit_id: rv.commit_id } : {}), ...(run !== undefined ? { run } : {}) });
       }
       if (++pages >= maxPages) break;
     }
@@ -444,19 +500,53 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
   const earlierApprovals = (ours: OurReview[]): number[] =>
     ours.filter((rv) => rv.state === "APPROVED" && posted.get(rv.id) !== "APPROVE").map((rv) => rv.id);
 
-  /** Why an APPROVE for headSha must not be submitted now (undefined: it may). */
-  const approvalWithheld = async (): Promise<string | undefined> => {
+  /**
+   * Right before posting a review: throws StaleHeadError when the pull request head is no longer
+   * headSha, and an Error when the pull request cannot be read (no review of any event is posted on
+   * an unverified commit); otherwise returns why an APPROVE must not be submitted now (undefined: it may).
+   */
+  const verifyReviewHead = async (): Promise<string | undefined> => {
     if (headSha === "") return "the reviewed commit is unknown";
     let pr: PullRequestState;
     try {
       pr = await getPullRequest();
     } catch (e) {
       audit("github.pull_request_unreadable", { status: statusOf(e), error: sliceSafe(errorText(e), 300) });
-      return "the pull request's current head could not be verified";
+      throw new Error(`no review posted: the pull request's current head could not be verified (${sliceSafe(errorText(e), 200)})`);
+    }
+    if (!isOurHead(pr.head_sha)) {
+      throw new StaleHeadError(`the pull request head moved to ${short(pr.head_sha)} after commit ${short(headSha)} was reviewed`, pr.head_sha);
     }
     if (pr.state !== "open") return `the pull request is ${singleLine(pr.state, 20)}`;
-    if (!isOurHead(pr.head_sha)) return `the pull request head moved to ${short(pr.head_sha)} after commit ${short(headSha)} was reviewed`;
     return undefined;
+  };
+
+  const findStickyComment = async (marker: string): Promise<IssueCommentRef | undefined> => {
+    if (typeof marker !== "string" || marker.trim() === "") throw new Error("sticky marker must be non-empty");
+    const self = await getAuthenticatedLogin();
+    let pages = 0;
+    for await (const page of octokit.paginate.iterator(octokit.rest.issues.listComments, {
+      owner,
+      repo,
+      issue_number: prNumber,
+      per_page: 100,
+    })) {
+      for (const c of page.data) {
+        if (isSelf(self, c.user) && typeof c.body === "string" && c.body.includes(marker)) return { id: c.id, body: c.body };
+      }
+      if (++pages >= maxPages) break;
+    }
+    return undefined;
+  };
+
+  /**
+   * With `run`: the review body with this run's marker at its end, or just before a final
+   * REVIEW_MARKER (which stays last).
+   */
+  const withRunMarker = (body: string): string => {
+    if (!opts.run) return body;
+    const marker = runMarker(opts.run.id);
+    return body.endsWith(REVIEW_MARKER) ? `${body.slice(0, -REVIEW_MARKER.length)}${marker}\n${REVIEW_MARKER}` : `${body}\n\n${marker}`;
   };
 
   interface CheckRef {
@@ -516,23 +606,7 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
       return keys;
     },
 
-    async findStickyComment(marker: string): Promise<IssueCommentRef | undefined> {
-      if (typeof marker !== "string" || marker.trim() === "") throw new Error("sticky marker must be non-empty");
-      const self = await getAuthenticatedLogin();
-      let pages = 0;
-      for await (const page of octokit.paginate.iterator(octokit.rest.issues.listComments, {
-        owner,
-        repo,
-        issue_number: prNumber,
-        per_page: 100,
-      })) {
-        for (const c of page.data) {
-          if (isSelf(self, c.user) && typeof c.body === "string" && c.body.includes(marker)) return { id: c.id, body: c.body };
-        }
-        if (++pages >= maxPages) break;
-      }
-      return undefined;
-    },
+    findStickyComment,
 
     async createIssueComment(body: string): Promise<{ id: number }> {
       const r = await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body: checkBody(body) });
@@ -556,14 +630,14 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
         try {
           const res = await octokit.rest.pulls.createReview({
             ...base,
-            body: checkBody(body),
+            body: checkBody(withRunMarker(body)),
             ...(comments.length > 0 ? { comments } : {}),
           });
           return { id: res.data.id, inlineFallback: false };
         } catch (e) {
           if (comments.length === 0 || !isLineResolutionError(e)) throw e;
           audit("github.review.inline_fallback", { comments: comments.length, error: sliceSafe(errorText(e), 500) });
-          const res = await octokit.rest.pulls.createReview({ ...base, body: checkBody(foldCommentsIntoBody(body, r.comments)) });
+          const res = await octokit.rest.pulls.createReview({ ...base, body: checkBody(withRunMarker(foldCommentsIntoBody(body, r.comments))) });
           return { id: res.data.id, inlineFallback: true };
         }
       };
@@ -572,15 +646,15 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
         return res;
       };
       const verifyHead = opts.verifyHead ?? opts.downgradeRefusedEvent === true;
-      if (r.event === "APPROVE" && verifyHead) {
-        const withheld = await approvalWithheld();
-        if (withheld !== undefined) {
-          audit("github.review.approval_withheld", { reason: withheld, head_sha: headSha });
-          if (!opts.downgradeRefusedEvent) throw new Error(`approval withheld: ${withheld}`);
-          const note = `> **Note:** This review was not submitted as an approval (${inlineCode(withheld, 200)}), so it was posted as a comment: it does not approve the pull request.`;
-          const res = await post("COMMENT", `${note}\n\n${r.body}`);
-          return { ...record(res, "COMMENT"), event: "COMMENT", downgraded: { from: "APPROVE", reason: withheld, withheld: true } };
-        }
+      // Throws (nothing posted) when the head moved or cannot be read, whatever the event.
+      const headIssue = verifyHead ? await verifyReviewHead() : undefined;
+      const withheld = r.event === "APPROVE" ? (headIssue ?? opts.withholdApproval) : undefined;
+      if (withheld !== undefined) {
+        audit("github.review.approval_withheld", { reason: withheld, head_sha: headSha });
+        if (!opts.downgradeRefusedEvent) throw new Error(`approval withheld: ${withheld}`);
+        const note = `> **Note:** This review was not submitted as an approval (${inlineCode(withheld, 200)}), so it was posted as a comment: it does not approve the pull request.`;
+        const res = await post("COMMENT", `${note}\n\n${r.body}`);
+        return { ...record(res, "COMMENT"), event: "COMMENT", downgraded: { from: "APPROVE", reason: withheld, withheld: true } };
       }
       try {
         return record(await post(r.event, r.body), r.event);
@@ -634,6 +708,24 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
 
     getPullRequest,
 
+    async listPullRequestFiles(): Promise<PullRequestFile[]> {
+      const out: PullRequestFile[] = [];
+      for await (const page of octokit.paginate.iterator(octokit.rest.pulls.listFiles, { owner, repo, pull_number: prNumber, per_page: 100 })) {
+        for (const f of page.data) {
+          // The approval gate sums these: a missing count must not pass it as NaN.
+          if (![f.additions, f.deletions].every((n) => Number.isSafeInteger(n) && n >= 0)) throw new Error(`GitHub's file list has no line counts for ${f.filename}`);
+          out.push({
+            path: f.filename,
+            ...(typeof f.previous_filename === "string" && f.previous_filename !== "" ? { previous_path: f.previous_filename } : {}),
+            additions: f.additions,
+            deletions: f.deletions,
+          });
+        }
+      }
+      if (out.length >= MAX_LISTED_FILES) throw new Error(`GitHub lists at most ${MAX_LISTED_FILES} changed files: the list may be incomplete`);
+      return out;
+    },
+
     async runFreshness(checkName?: string): Promise<RunFreshness> {
       const pr = await getPullRequest();
       const base = { head_sha: pr.head_sha, state: pr.state };
@@ -644,6 +736,15 @@ export function createGitHubApi(opts: GitHubApiOptions): GitHubApi {
         const newer = newerRunCheck(await listChecks(checkName, pr.head_sha));
         if (newer?.run !== undefined) {
           return { ...base, current: false, newer_run: newer.run, reason: `workflow run ${newer.run} (newer than run ${opts.run.id}) already published for this commit` };
+        }
+      }
+      if (opts.run) {
+        // Without a check run, a newer run's sticky comment or review says so (runMarker).
+        const sticky = await findStickyComment(STICKY_MARKER);
+        const runs = [runIdFromMarker(sticky?.body), ...(await listOurReviews()).map((rv) => rv.run)];
+        const newest = Math.max(-1, ...runs.filter((id): id is number => id !== undefined));
+        if (newest > opts.run.id) {
+          return { ...base, current: false, newer_run: newest, reason: `workflow run ${newest} (newer than run ${opts.run.id}) already published on this pull request` };
         }
       }
       return { ...base, current: true };

@@ -42,19 +42,23 @@ function isPlaceholder(v: string): boolean {
 }
 
 /**
- * Quoted values that are ordinary code rather than credentials: placeholders, URLs without
- * credentials, lowercase paths, kebab/snake identifiers ("x-auth-token", "refresh_token") and
+ * Quoted values that are ordinary code rather than credentials: placeholders, URLs (credentials in
+ * them have their own rule), lowercase paths, kebab/snake identifiers ("x-auth-token", "refresh_token") and
  * UPPER_SNAKE env-var names ("GITHUB_TOKEN").
  */
 function isBenignValue(v: string): boolean {
   return (
     isPlaceholder(v) ||
-    v.includes("://") ||
+    /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(v) ||
     /^\.{0,2}\/[a-z0-9_.\/-]*$/.test(v) ||
     /^[a-z]+(?:[-_.][a-z]+)+$/.test(v) ||
     /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/.test(v)
   );
 }
+
+/** "Basic" credentials are base64 of printable "user:password". */
+const isBasicCredential = (tok: string): boolean =>
+  /^[\x20-\x7e]*:[\x20-\x7e]*$/.test(Buffer.from(tok, "base64").toString("latin1"));
 
 const RULES: Rule[] = [
   // GitHub tokens: classic (ghp_/gho_/ghu_/ghs_/ghr_ + 36) and fine-grained PATs.
@@ -67,12 +71,26 @@ const RULES: Rule[] = [
     kind: "slack_webhook",
     re: /(?:https?:\/\/)?hooks\.slack\.com\/(?:services|workflows|triggers)\/[A-Za-z0-9_\/-]{8,512}/g,
   },
-  { kind: "slack_token", re: /(?<![A-Za-z0-9_-])xox[abposr]-[A-Za-z0-9-]{10,250}/g },
+  { kind: "slack_token", re: /(?<![A-Za-z0-9_-])xox[abposre]-[A-Za-z0-9-]{10,250}/g },
   { kind: "slack_token", re: /(?<![A-Za-z0-9_-])xapp-\d-[A-Za-z0-9-]{10,250}/g },
   // Google API keys.
   { kind: "google_api_key", re: /(?<![A-Za-z0-9_-])AIza[0-9A-Za-z_-]{35}(?![A-Za-z0-9_-])/g },
-  // Stripe live secret / restricted keys.
-  { kind: "stripe_key", re: /(?<![A-Za-z0-9_])(?:sk|rk)_live_[0-9A-Za-z]{16,255}/g },
+  // Google OAuth access tokens.
+  { kind: "google_oauth_token", re: /(?<![A-Za-z0-9._-])ya29\.[A-Za-z0-9._-]{20,2048}/g },
+  // Stripe secret / restricted keys (live and test) and webhook signing secrets.
+  { kind: "stripe_key", re: /(?<![A-Za-z0-9_])(?:sk|rk)_(?:live|test)_[0-9A-Za-z]{16,255}/g },
+  { kind: "stripe_key", re: /(?<![A-Za-z0-9_])whsec_[0-9A-Za-z]{24,255}/g },
+  // GitLab personal access tokens, npm tokens, SendGrid keys, Hugging Face tokens.
+  { kind: "gitlab_token", re: /(?<![A-Za-z0-9_-])glpat-[A-Za-z0-9_-]{20,255}/g },
+  { kind: "npm_token", re: /(?<![A-Za-z0-9_])npm_[A-Za-z0-9]{36}(?![A-Za-z0-9])/g },
+  { kind: "sendgrid_key", re: /(?<![A-Za-z0-9_.-])SG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}(?![A-Za-z0-9_-])/g },
+  { kind: "huggingface_token", re: /(?<![A-Za-z0-9_])hf_[A-Za-z]{34}(?![A-Za-z0-9_])/g },
+  // Azure storage / Service Bus connection-string keys (keep the key name).
+  {
+    kind: "azure_key",
+    re: /(?<![A-Za-z0-9])((?:Account|SharedAccess)Key=)([A-Za-z0-9+\/]{40,256}={0,2})/g,
+    replace: (_m, prefix = "") => `${prefix}${tag("azure_key")}`,
+  },
   // Anthropic keys (must run before the generic sk- rule).
   { kind: "anthropic_key", re: /(?<![A-Za-z0-9_-])sk-ant-[A-Za-z0-9_-]{20,300}/g },
   // OpenAI-style keys; require a digit to avoid kebab-case identifiers like "sk-spinner-...".
@@ -86,11 +104,20 @@ const RULES: Rule[] = [
     kind: "jwt",
     re: /(?<![A-Za-z0-9_-])eyJ[A-Za-z0-9_-]{8,4096}\.eyJ[A-Za-z0-9_-]{8,8192}\.[A-Za-z0-9_-]{0,4096}/g,
   },
-  // Bearer tokens in headers / curl commands (keep the scheme word).
+  // Bearer tokens in headers / curl commands (keep the scheme word). A token without a digit must
+  // be long enough not to be an identifier in prose or code ("Bearer accessTokenFromEnv").
   {
     kind: "bearer_token",
     re: /\b([Bb]earer[ \t]+)([A-Za-z0-9._~+\/-]{20,1024}=*)/g,
-    replace: (_m, prefix = "", tok = "") => (hasDigit(tok) ? `${prefix}${tag("bearer_token")}` : null),
+    replace: (_m, prefix = "", tok = "") =>
+      hasDigit(tok) || (tok.length >= 32 && !isBenignValue(tok)) ? `${prefix}${tag("bearer_token")}` : null,
+  },
+  // HTTP Basic credentials (keep the scheme word). The value must decode to "user:password", so
+  // prose ("Basic authentication") and expressions ("Basic " + encoded) are left alone.
+  {
+    kind: "basic_auth",
+    re: /\b(Basic[ \t]+)([A-Za-z0-9+\/]{8,1024}={0,2})/gi,
+    replace: (_m, prefix = "", tok = "") => (isBasicCredential(tok) ? `${prefix}${tag("basic_auth")}` : null),
   },
   // URLs with embedded credentials: scheme://user:pass@host -> scheme://[REDACTED]@host.
   {
@@ -99,12 +126,31 @@ const RULES: Rule[] = [
     replace: (_m, scheme = "", _user = "", pass = "") =>
       isPlaceholder(pass) ? null : `${scheme}${tag("url_credentials")}@`,
   },
+  // A token as the whole userinfo: https://<token>@host (usernames are shorter or have no digit).
+  {
+    kind: "url_credentials",
+    re: /\b(https?:\/\/)([A-Za-z0-9_-]{20,256})@/g,
+    replace: (_m, scheme = "", tok = "") => (hasDigit(tok) ? `${scheme}${tag("url_credentials")}@` : null),
+  },
+  // AWS secret access keys (40 base64 chars) in unquoted ini / env assignments (~/.aws/credentials).
+  {
+    kind: "aws_secret_key",
+    re: /(?<![A-Za-z0-9])(aws_secret_access_key[ \t]{0,5}[=:][ \t]{0,5})([A-Za-z0-9+\/]{40})(?![A-Za-z0-9+\/=])/gi,
+    replace: (_m, head = "") => `${head}${tag("aws_secret_key")}`,
+  },
   // Quoted assignments: password = "....", "api_key": '....', SECRET_TOKEN := "...." (keep key).
   {
     kind: "secret_assignment",
     re: /((?:password|passwd|passphrase|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[A-Za-z0-9_.-]{0,40}["'`]?[ \t]{0,5}(?::=|=>|=|:)[ \t]{0,5})(["'`])([^"'`\s\\]{8,512})\2/gi,
     replace: (_m, head = "", quote = "", value = "") =>
       isBenignValue(value) ? null : `${head}${quote}${tag("secret_assignment")}${quote}`,
+  },
+  // Unquoted env-file / shell assignments: an UPPER_SNAKE key ending in a secret word at the start
+  // of a line, "=" with no spaces, a value up to whitespace (DB_PASSWORD=..., export X_TOKEN=...).
+  {
+    kind: "secret_assignment",
+    re: /^([ \t]*(?:(?:export|ENV)[ \t]+|-[ \t]+)?[A-Z0-9_]{0,40}(?:PASSWORD|PASSWD|PASSPHRASE|SECRET(?:_KEY)?|TOKEN|API_?KEY|ACCESS_KEY|PRIVATE_KEY)=)([^\s"'`$(){}\[\];,<>]{8,512})(?!\S)/gm,
+    replace: (_m, head = "", value = "") => (isBenignValue(value) ? null : `${head}${tag("secret_assignment")}`),
   },
 ];
 

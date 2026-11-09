@@ -208,7 +208,9 @@ Details and the full excerpt are in [E2E-LOCAL.md](E2E-LOCAL.md).
     sandbox, so the runtime stage used `--build-arg RUNTIME_IMAGE=ubuntu:24.04` (new optional arg;
     node is copied from the build stage). npm runs behind a TLS-intercepting proxy, so the build
     used `--secret id=npm_ca,src=<ca bundle>` (new optional build secret).
-  - **The default build is unchanged** and needs neither workaround.
+  - **The default build is unchanged** and needs neither workaround. (Later: ubuntu:24.04 became
+    the default `RUNTIME_IMAGE`, since Debian 12 ships ripgrep 13 and git 2.39, without
+    `--attr-source`.)
   - **Checks inside the xsearch container, run with prepare's exact flags and mounts:**
     - uid/gid 65534
     - `/`, `/app`, `/pr`, `/ctx` and `/mirror/*` all fail with `EROFS`; `/tmp` is a writable noexec tmpfs

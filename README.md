@@ -68,10 +68,14 @@ tool-call sequence, token / cost baseline and the published plan).
 2. **Image and CLI**
    ```sh
    docker build -f docker/Dockerfile \
-     --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> -t xrepo-review:latest .
+     --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> \
+     --build-arg RUNTIME_IMAGE=ubuntu:24.04@sha256:<digest> -t xrepo-review:latest .
    npm ci && npm run build && npm install -g .     # puts `xrepo` on PATH
    ```
    (Or pass `xrepo_ref: <commit sha>` to the workflow and let it build both from this repository.)
+   Build the CLI and image from the same commit your callers pin `review.yml` to (or pass
+   `xrepo_ref`): on a mismatch the publish job fails without publishing, since `xrepo publish` now
+   requires the `--repo` / `--pr-number` the workflow passes.
 3. **Policy**: copy [examples/policy.yaml](examples/policy.yaml) to
    `/etc/xrepo-review/policy.yaml` (root-owned, mode 0644) and check it:
    ```sh
@@ -228,8 +232,9 @@ Rules worth knowing:
   request approvals when new commits are pushed". A run with nothing for the sticky comment (e.g.
   a skip, or the summary in the review) replaces an earlier one with a short status note.
 - **Replayed runs.** A run that no longer reviews the PR's head (re-running an old workflow run,
-  or a push while it ran) or whose commit a newer run already published posts only its check run;
-  it never approves, dismisses, comments or labels.
+  or a push while it ran) or whose commit a newer run already published (its check, or its hidden
+  run marker on the sticky comment or on one of our reviews) posts only its check run (nothing
+  when no check is configured); it never approves, dismisses, comments or labels.
 
 ## Chaining your own workflows
 
@@ -353,7 +358,8 @@ xrepo prepare      --policy <file> --pr-checkout <dir> --work <dir> [--repo o/n]
                    [--launcher docker|local] [--image IMG] [--action-cwd <dir>]
                    [--untrusted-dir <dir> ...] [--policy-repo-path <path>] [--github-output <file>]
 xrepo collect      --work <dir> --agent-outcome <outcome> [--execution-file <path>]
-xrepo publish      --ctx <dir> --draft <file> [--dry-run] [--agent-outcome …] [--policy <file>] …
+xrepo publish      --ctx <dir> --draft <file> [--dry-run] [--agent-outcome …] [--policy <file>]
+                   [--repo o/n --pr-number N [--head-sha S]] …   (identity required in Actions)
 xrepo sync         --policy <file> --mirror <dir> [--repo o/n …] [--owner L] [--url-template T]
                    [--snapshot-grace-minutes N] [--dry-run]
 xrepo retry        --policy <file> --workflow <caller.yml> [--repo o/n …] [--owner L]
@@ -423,7 +429,9 @@ after a `fail_job` outcome or an API error.) It republishes the same review from
 artifact: the publish job downloads the artifact name the review job reports (output `artifact`),
 not one derived from its own, incremented `run_attempt`. If that artifact is gone (3-day
 retention), publish fails without touching the PR (no "could not run" comment, no neutral check
-replacing a failing one). Use **Re-run all jobs** to review again.
+replacing a failing one). Once a newer workflow run has published (its run marker on the sticky
+comment or on one of our reviews), the older run's re-run posts only its check (nothing when no
+check is configured). Use **Re-run all jobs** to review again.
 
 **Does a failed or rate-limited review block merging?** No — `usage_limit`, `error` and
 `incomplete` publish a neutral check by default. Set `fail_job` or a `check_conclusion` per outcome

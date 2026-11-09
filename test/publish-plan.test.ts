@@ -12,6 +12,9 @@ import {
   isLineResolutionError,
   runExternalId,
   runIdFromExternalId,
+  runIdFromMarker,
+  runMarker,
+  StaleHeadError,
   type RunRef,
 } from "../src/publish/github.js";
 import {
@@ -852,7 +855,9 @@ describe("github.ts: createReview with downgradeRefusedEvent", () => {
 
   it("downgrades a refused REQUEST_CHANGES and still folds comments on a later line error", async () => {
     let n = 0;
-    const { client, calls } = fakeApi(() => {
+    const { client, calls: all } = fakeApi((c) => {
+      const pr = prRoute(c);
+      if (pr) return pr;
       n++;
       if (n === 1) return { status: 422, body: { message: "Unprocessable Entity", errors: ["Can not request changes on your own pull request"] } };
       if (n === 2) return { status: 422, body: { message: "Unprocessable Entity", errors: ["Line could not be resolved"] } };
@@ -860,6 +865,8 @@ describe("github.ts: createReview with downgradeRefusedEvent", () => {
     });
     const r = await client.createReview({ ...review, event: "REQUEST_CHANGES" }, { downgradeRefusedEvent: true });
     expect(r).toMatchObject({ id: 92, inlineFallback: true, event: "COMMENT", downgraded: { from: "REQUEST_CHANGES", reason: "Can not request changes on your own pull request" } });
+    expect(all[0]).toMatchObject({ method: "GET", path: "/repos/acme/api/pulls/7" }); // every event verifies the head
+    const calls = all.filter((c) => c.method === "POST");
     expect(calls).toHaveLength(3);
     expect(calls[2]!.body!.comments).toBeUndefined();
     expect(String(calls[2]!.body!.body)).toContain(commentMarker("111111111111"));
@@ -1021,21 +1028,15 @@ describe("github.ts: stale approvals", () => {
     expect(calls.filter((c) => c.method === "PUT").map((c) => c.path)).toEqual(["/repos/acme/api/pulls/7/reviews/1/dismissals"]);
   });
 
-  it("never approves a head it did not review (a re-run of an older run) or a PR it cannot read", async () => {
-    for (const [route, reason] of [
-      [(c: Call) => prRoute(c, "2222222"), "the pull request head moved to 2222222 after commit abc123 was reviewed"],
-      [(c: Call) => prRoute(c, HEAD, "closed"), "the pull request is closed"],
-      [(c: Call) => (c.path === "/repos/acme/api/pulls/7" ? { status: 404, body: { message: "Not Found" } } : undefined), "the pull request's current head could not be verified"],
-    ] as const) {
-      const { client, calls } = fakeApi((c) => route(c) ?? { body: { id: 60 } });
-      const r = await client.createReview({ event: "APPROVE", body: "ok", comments: [] }, { downgradeRefusedEvent: true });
-      expect(r).toMatchObject({ id: 60, event: "COMMENT", downgraded: { from: "APPROVE", reason } });
-      const posts = calls.filter((c) => c.method === "POST");
-      expect(posts.map((c) => c.body?.event)).toEqual(["COMMENT"]);
-      expect(String(posts[0]!.body!.body)).toContain("it does not approve the pull request");
-    }
+  it("never approves a closed pull request", async () => {
+    const { client, calls } = fakeApi((c) => prRoute(c, HEAD, "closed") ?? { body: { id: 60 } });
+    const r = await client.createReview({ event: "APPROVE", body: "ok", comments: [] }, { downgradeRefusedEvent: true });
+    expect(r).toMatchObject({ id: 60, event: "COMMENT", downgraded: { from: "APPROVE", reason: "the pull request is closed" } });
+    const posts = calls.filter((c) => c.method === "POST");
+    expect(posts.map((c) => c.body?.event)).toEqual(["COMMENT"]);
+    expect(String(posts[0]!.body!.body)).toContain("it does not approve the pull request");
     // Without downgradeRefusedEvent (and with verifyHead) the call throws instead of approving.
-    const strict = fakeApi((c) => prRoute(c, "2222222") ?? { body: { id: 61 } });
+    const strict = fakeApi((c) => prRoute(c, HEAD, "closed") ?? { body: { id: 61 } });
     await expect(strict.client.createReview({ event: "APPROVE", body: "ok", comments: [] }, { verifyHead: true })).rejects.toThrow(/approval withheld/);
     expect(strict.calls.filter((c) => c.method === "POST")).toEqual([]);
   });
@@ -1087,8 +1088,118 @@ describe("github.ts: check runs of replayed / skipped runs", () => {
       { id: 90, attempt: 3 },
     );
     expect(await newer.client.runFreshness!("xrepo-review")).toMatchObject({ current: false, newer_run: 100 });
-    const ok = fakeApi((c) => prRoute(c) ?? checkList([])(c) ?? { body: {} }, "me[bot]", { id: 101 });
+    const ok = fakeApi((c) => prRoute(c) ?? checkList([])(c) ?? { body: [] }, "me[bot]", { id: 101 });
     expect(await ok.client.runFreshness!("xrepo-review")).toMatchObject({ current: true, head_sha: HEAD });
+  });
+});
+
+// stale-run-posts-review, publisher-trusts-artifact-pr-identity
+describe("github.ts: no review on a moved head, full-sha heads, run markers, GitHub's file list", () => {
+  const review = (event: PlanReview["event"]): PlanReview => ({ event, body: `Automated review.\n\n${REVIEW_MARKER}`, comments: [] });
+
+  it("a push after the freshness read: no review of any event is posted on the old commit", async () => {
+    for (const event of ["COMMENT", "REQUEST_CHANGES", "APPROVE"] as const) {
+      const { client, calls } = fakeApi((c) => prRoute(c, "2222222") ?? { body: { id: 70 } });
+      const err = await client.createReview(review(event), { downgradeRefusedEvent: true }).catch((e: unknown) => e);
+      expect(err, event).toBeInstanceOf(StaleHeadError);
+      expect(err).toMatchObject({ head_sha: "2222222", message: "the pull request head moved to 2222222 after commit abc123 was reviewed" });
+      expect(calls.filter((c) => c.method === "POST"), event).toEqual([]);
+    }
+  });
+
+  it("an unreadable pull request: no review of any event is posted on the unverified commit", async () => {
+    for (const event of ["COMMENT", "REQUEST_CHANGES", "APPROVE"] as const) {
+      const { client, calls } = fakeApi((c) => (c.path === "/repos/acme/api/pulls/7" ? { status: 500, body: { message: "boom" } } : { body: { id: 71 } }));
+      const err = await client.createReview(review(event), { downgradeRefusedEvent: true }).catch((e: unknown) => e);
+      expect(err, event).toBeInstanceOf(Error);
+      expect(err, event).not.toBeInstanceOf(StaleHeadError);
+      expect((err as Error).message).toContain("no review posted: the pull request's current head could not be verified");
+      expect(calls.filter((c) => c.method === "POST"), event).toEqual([]);
+    }
+  });
+
+  it("withholdApproval posts the approval as a COMMENT, like a closed pull request", async () => {
+    const { client, calls } = fakeApi((c) => prRoute(c) ?? { body: { id: 72 } });
+    const r = await client.createReview(review("APPROVE"), { downgradeRefusedEvent: true, withholdApproval: "on GitHub's file list: x" });
+    expect(r).toMatchObject({ id: 72, event: "COMMENT", downgraded: { from: "APPROVE", reason: "on GitHub's file list: x", withheld: true } });
+    expect(calls.filter((c) => c.method === "POST").map((c) => c.body?.event)).toEqual(["COMMENT"]);
+    // Other events ignore it.
+    const other = fakeApi((c) => prRoute(c) ?? { body: { id: 73 } });
+    expect(await other.client.createReview(review("COMMENT"), { downgradeRefusedEvent: true, withholdApproval: "x" })).toEqual({ id: 73, inlineFallback: false });
+  });
+
+  it("compares the head in full: an abbreviated head is never the pull request's head", async () => {
+    const full = "abcdef1".padEnd(40, "0");
+    const calls: string[] = [];
+    const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname;
+      calls.push(`${init?.method ?? "GET"} ${path}`);
+      const body = path === "/repos/acme/api/pulls/7" ? { state: "open", head: { sha: full } } : path.endsWith("/reviews") && init?.method === "POST" ? { id: 1 } : [];
+      return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } });
+    }) as typeof fetch;
+    const client = createGitHubApi({ token: "t", repo: "acme/api", prNumber: 7, headSha: "abcdef1", baseUrl: "https://api.test", fetch: fetchImpl, selfLogin: "me[bot]" });
+    expect(await client.runFreshness!()).toMatchObject({ current: false });
+    await expect(client.createReview(review("APPROVE"), { downgradeRefusedEvent: true })).rejects.toBeInstanceOf(StaleHeadError);
+    expect(calls.filter((c) => c.startsWith("POST"))).toEqual([]);
+  });
+
+  it("every review body carries the run's marker, read only at the end of a body", async () => {
+    const { client, calls } = fakeApi((c) => prRoute(c) ?? { body: { id: 74 } }, "me[bot]", { id: 500, attempt: 2 });
+    await client.createReview({ ...review("COMMENT"), comments: [{ path: "a.ts", line: 1, side: "RIGHT", body: "x" }] }, { downgradeRefusedEvent: true });
+    const body = String(calls.find((c) => c.method === "POST")!.body!.body);
+    expect(body).toBe(`Automated review.\n\n${runMarker(500)}\n${REVIEW_MARKER}`);
+    expect(isXrepoReviewBody(body)).toBe(true);
+    expect(runIdFromMarker(body)).toBe(500);
+    // The 422 fallback folds comments after the body: the marker still ends it.
+    const folded = fakeApi((c) => prRoute(c) ?? (c.body?.comments ? { status: 422, body: { message: "Line could not be resolved" } } : { body: { id: 75 } }), "me[bot]", { id: 501 });
+    await folded.client.createReview({ ...review("COMMENT"), comments: [{ path: "a.ts", line: 1, side: "RIGHT", body: "x" }] }, { downgradeRefusedEvent: true });
+    expect(runIdFromMarker(String(folded.calls.filter((c) => c.method === "POST").at(-1)!.body!.body))).toBe(501);
+    // A marker anywhere else (e.g. quoted agent text) is not ours.
+    expect(runIdFromMarker(`\`${runMarker(999)}\`\n\nsummary`)).toBeUndefined();
+    expect(runIdFromMarker(stickyCommentBody(`summary\n\n${runMarker(42)}`))).toBe(42);
+    expect(runIdFromMarker(null)).toBeUndefined();
+  });
+
+  it("runFreshness: without a check, a newer run's sticky comment or review makes the run stale", async () => {
+    const route = (sticky: string, reviews: unknown[]) => (c: Call) =>
+      prRoute(c) ??
+      (c.path === "/repos/acme/api/issues/7/comments" ? { body: [{ id: 1, user: { login: "me[bot]" }, body: sticky }] } : undefined) ??
+      (c.path === "/repos/acme/api/pulls/7/reviews" ? { body: reviews } : { body: [] });
+    const ourReview = (run: number) => ({ id: 3, user: { login: "me[bot]" }, state: "COMMENTED", commit_id: HEAD, body: `x\n\n${runMarker(run)}\n${REVIEW_MARKER}` });
+    const newerSticky = fakeApi(route(stickyCommentBody(`s\n\n${runMarker(200)}`), []), "me[bot]", { id: 100, attempt: 2 });
+    expect(await newerSticky.client.runFreshness!()).toMatchObject({ current: false, newer_run: 200 });
+    const newerReview = fakeApi(route(stickyCommentBody("s"), [ourReview(150)]), "me[bot]", { id: 100 });
+    expect(await newerReview.client.runFreshness!()).toMatchObject({ current: false, newer_run: 150 });
+    // Our own run (re-run of the publish job), an older run, or a marker by someone else: current.
+    const same = fakeApi(route(stickyCommentBody(`s\n\n${runMarker(100)}`), [ourReview(90)]), "me[bot]", { id: 100, attempt: 3 });
+    expect(await same.client.runFreshness!()).toMatchObject({ current: true });
+    const forged = fakeApi(
+      (c) => (c.path.endsWith("/reviews") ? { body: [{ ...ourReview(900), user: { login: "mallory" } }] } : route(stickyCommentBody("s"), [])(c)),
+      "me[bot]",
+      { id: 100 },
+    );
+    expect(await forged.client.runFreshness!()).toMatchObject({ current: true });
+  });
+
+  it("listPullRequestFiles: GitHub's file list, previous names included; an incomplete list throws", async () => {
+    const files = [
+      { filename: "a.ts", status: "modified", additions: 2, deletions: 1 },
+      { filename: "b.ts", previous_filename: ".github/old.ts", status: "renamed", additions: 0, deletions: 0 },
+    ];
+    const { client } = fakeApi((c) => (c.path === "/repos/acme/api/pulls/7/files" ? { body: files } : { body: [] }));
+    expect(await client.listPullRequestFiles!()).toEqual([
+      { path: "a.ts", additions: 2, deletions: 1 },
+      { path: "b.ts", previous_path: ".github/old.ts", additions: 0, deletions: 0 },
+    ]);
+    // GitHub stops listing at 3000 files (one fake page stands for the 30 real ones).
+    const many = Array.from({ length: 3000 }, (_, i) => ({ filename: `f${i}`, additions: 1, deletions: 0 }));
+    const capped = fakeApi((c) => ({ body: c.path === "/repos/acme/api/pulls/7/files" ? many : [] }));
+    await expect(capped.client.listPullRequestFiles!()).rejects.toThrow(/at most 3000/);
+    // A file without line counts would sum to NaN and pass approve.max_changed_lines: it throws.
+    for (const bad of [{ additions: 1 }, { additions: "1", deletions: 0 }, { additions: 1, deletions: -1 }]) {
+      const blind = fakeApi((c) => ({ body: c.path === "/repos/acme/api/pulls/7/files" ? [{ filename: "a.ts", ...bad }] : [] }));
+      await expect(blind.client.listPullRequestFiles!(), JSON.stringify(bad)).rejects.toThrow(/no line counts for a.ts/);
+    }
   });
 });
 

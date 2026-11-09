@@ -8,18 +8,19 @@
 #
 # Build:  docker build -f docker/Dockerfile -t xrepo-review:<version> .
 #
-# PRODUCTION: pin the base image by digest so a re-tag upstream cannot change what runs, e.g.
-#   docker build --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> ...
-# (look the digest up with `docker buildx imagetools inspect node:22-bookworm-slim`), and reference
+# PRODUCTION: pin both base images by digest so a re-tag upstream cannot change what runs, e.g.
+#   docker build --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> \
+#                --build-arg RUNTIME_IMAGE=ubuntu:24.04@sha256:<digest> ...
+# (look the digests up with `docker buildx imagetools inspect <image>`), and reference
 # the resulting image by digest (ghcr.io/<org>/xrepo-review@sha256:...) in the workflows.
 # No ctags and no ast-grep: xsearch is ripgrep only (SPEC "xsearch").
 #
-# RUNTIME_IMAGE (optional): base of the runtime stage; any glibc-based Debian/Ubuntu image with apt.
-# Defaults to NODE_IMAGE. The node binary is copied from the build stage, so e.g.
-#   --build-arg RUNTIME_IMAGE=ubuntu:24.04
-# works where the Debian package mirrors are unreachable (docs/RESEARCH.md "Local verification").
+# RUNTIME_IMAGE: base of the runtime stage; any glibc-based Debian/Ubuntu image with apt. The node
+# binary is copied from the build stage. The default, ubuntu:24.04, ships ripgrep 14.1 and git 2.43,
+# the verified toolchain; Debian 12 (bookworm) has only ripgrep 13 and git 2.39, which lacks
+# `--attr-source` (git >= 2.40). CI asserts the minimum versions.
 ARG NODE_IMAGE=node:22-bookworm-slim
-ARG RUNTIME_IMAGE=${NODE_IMAGE}
+ARG RUNTIME_IMAGE=ubuntu:24.04
 
 FROM ${NODE_IMAGE} AS build
 WORKDIR /src
@@ -40,7 +41,7 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ripgrep git ca-certificates \
  && rm -rf /var/lib/apt/lists/* \
  && rg --version && git --version
-# Same node as the build stage (a no-op when RUNTIME_IMAGE is the node image).
+# Same node as the build stage.
 COPY --from=build --chown=0:0 /usr/local/bin/node /usr/local/bin/node
 RUN node --version
 WORKDIR /app

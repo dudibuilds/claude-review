@@ -231,6 +231,7 @@ class FakeGitHub {
       };
       if (path === "/user" || path === "/app") return send(403, { message: "Resource not accessible by integration" });
       if (method === "GET") {
+        if (/\/pulls\/\d+$/.test(path)) return send(200, { state: "open", head: { sha: HEAD } });
         if (/\/issues\/\d+\/comments$/.test(path)) return send(200, this.comments);
         return send(200, []);
       }
@@ -703,6 +704,32 @@ describe("review.yml: skipped pull requests from forks (defect: read-only token 
     const run2 = await runPublishJob(store2, reviewed, { attempt: 1, repo: "acme/web", event: forkEvent, policy: join(ROOT, "e2e", "policy.yaml"), xrepo: { publishRc: 1, dryRunRc: 0 } });
     expect(run2.code).toBe(1);
     expect(run2.env.XREPO_CALLS).not.toContain("--dry-run");
+  });
+});
+
+/* ------------------------- the PR identity comes from the workflow ------------------------- */
+
+describe("review.yml: the publish job takes the PR identity from the workflow (defect: publisher trusts the artifact's pr.json)", () => {
+  it("passes the event's repository, number and head, or the pr_number input without a head", () => {
+    const env = PUBLISH_STEP.env!;
+    const ev = (ctx: Ctx): [string, string] => [interpolate(env.PR_NUMBER!, ctx), interpolate(env.EVENT_HEAD_SHA!, ctx)];
+    expect(ev({ github: { event: prEvent("acme/web", "acme/web") }, inputs: {} })).toEqual(["42", HEAD]);
+    expect(ev({ github: { event: {} }, inputs: { pr_number: "7" } })).toEqual(["7", ""]);
+    expect(PUBLISH_STEP.run).toContain('--repo "$GITHUB_REPOSITORY" --pr-number "$PR_NUMBER"');
+    expect(PUBLISH_STEP.run).toContain('args+=(--head-sha "$EVENT_HEAD_SHA")');
+  });
+
+  it("an artifact whose pr.json names another pull request publishes nothing and fails the job", async () => {
+    gh.reset();
+    const store: ArtifactStore = new Map();
+    const files = reviewArtifact({ repo: "acme/web" });
+    files["ctx/pr.json"] = JSON.stringify({ ...(JSON.parse(files["ctx/pr.json"]!) as Record<string, unknown>), number: 43 });
+    const review = runReviewJob(store, { attempt: 1, files });
+    const run = await runPublishJob(store, review, { attempt: 1, repo: "acme/web", event: prEvent("acme/web", "acme/web"), policy: join(ROOT, "e2e", "policy.yaml") });
+    expect(run.code).toBe(1);
+    expect(run.stderr).toContain("refusing to publish anything: ctx/pr.json names pull request #43, but this workflow runs for #42");
+    expect(gh.requests).toEqual([]);
+    expect(run.env.XREPO_CALLS).toContain(`--repo acme/web --pr-number 42 --head-sha ${HEAD}`);
   });
 });
 

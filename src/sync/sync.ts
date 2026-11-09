@@ -772,6 +772,21 @@ function safeReaddir(dir: string): string[] {
   }
 }
 
+/**
+ * `repo`'s owner and name segments as already spelled in the mirror. GitHub names are
+ * case-insensitive, so a desired name whose case changed (policy edit, API listing) maps to the
+ * existing directory on case-sensitive and case-insensitive filesystems alike; an exact match wins.
+ */
+function onDiskName(mirrorDir: string, repo: string): [string, string] {
+  const pick = (dir: string, seg: string): string => {
+    const entries = safeReaddir(dir);
+    return entries.includes(seg) ? seg : (entries.find((e) => e.toLowerCase() === seg.toLowerCase()) ?? seg);
+  };
+  const [owner, name] = repo.split("/") as [string, string];
+  const o = pick(mirrorDir, owner);
+  return [o, pick(join(mirrorDir, o), name)];
+}
+
 /* ---------------------------------- lock ---------------------------------- */
 
 interface LockInfo {
@@ -1198,9 +1213,6 @@ async function buildSnapshot(ctx: RepoCtx, url: string, env: NodeJS.ProcessEnv, 
 async function syncRepo(ctx: RepoCtx, want: Desired): Promise<RepoResult> {
   const repo = want.name;
   const [owner, name] = repo.split("/") as [string, string];
-  const ownerDir = join(ctx.mirrorDir, owner);
-  const repoDir = join(ownerDir, name);
-  const snapRoot = join(repoDir, SNAPSHOTS);
   let tmp: string | undefined;
   try {
     const url = buildRepoUrl(ctx.template, repo);
@@ -1210,6 +1222,11 @@ async function syncRepo(ctx: RepoCtx, want: Desired): Promise<RepoResult> {
       audit("sync.repo_empty", { repo });
       return { repo, action: "empty", error: "remote has no HEAD (empty repository?)" };
     }
+    // Resolved with no await before the mkdirs below, so concurrent repos of one owner agree.
+    const [ownerSeg, nameSeg] = onDiskName(ctx.mirrorDir, repo);
+    const ownerDir = join(ctx.mirrorDir, ownerSeg);
+    const repoDir = join(ownerDir, nameSeg);
+    const snapRoot = join(repoDir, SNAPSHOTS);
     const meta = readMeta(repoDir);
     const current = readCurrent(repoDir);
     const previous = meta?.sha ?? current;
@@ -1304,7 +1321,7 @@ interface Removal {
 }
 
 /**
- * Mirrored repos that are not in `keepNames` (and not protected by a failed `owner/*` expansion,
+ * Mirrored repos that are not in `keepNames` (spelled as on disk, see onDiskName; and not protected by a failed `owner/*` expansion,
  * unless excluded) are retired first (see retireRepo) and deleted only once they have been retired
  * for `graceMs`: a review that started while the repo was still listed may read its pinned snapshot
  * for as long as the review job runs. A marker that is missing, unreadable or dated in the future,
@@ -1451,8 +1468,7 @@ export async function syncMirror(opts: SyncOptions): Promise<SyncReport> {
     const results = await pool(res.desired, CONCURRENCY, async (want) => {
       const r = await syncRepo(ctx, want);
       if (!dryRun) {
-        const [owner, name] = want.name.split("/") as [string, string];
-        const repoDir = join(mirrorDir, owner, name);
+        const repoDir = join(mirrorDir, ...onDiskName(mirrorDir, want.name));
         const st = lstatOrUndefined(repoDir);
         if (st?.isDirectory() && !st.isSymbolicLink()) {
           try {
@@ -1471,7 +1487,7 @@ export async function syncMirror(opts: SyncOptions): Promise<SyncReport> {
     if (opts.repos === undefined) {
       removal = removeUnlisted(
         mirrorDir,
-        new Set(res.desired.map((d) => d.name)),
+        new Set(res.desired.map((d) => onDiskName(mirrorDir, d.name).join("/"))),
         res.failedPatterns,
         mirror.exclude,
         dryRun,

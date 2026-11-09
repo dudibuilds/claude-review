@@ -1553,18 +1553,25 @@ describe("agent globs never reach a backtracking regex (probe-glob-redos)", () =
   });
 
   it("Glob and Grep return promptly with a pathological glob over a long excluded file name", async () => {
-    let ticks = 0;
-    const timer = setInterval(() => ticks++, 20);
+    // The server runs in-process, so a backtracking match would stall this timer. Measure the longest
+    // stretch without a tick, the final one included: it does not depend on how fast the calls are.
     const t0 = Date.now();
+    let last = t0;
+    let maxGap = 0;
+    const timer = setInterval(() => {
+      maxGap = Math.max(maxGap, Date.now() - last);
+      last = Date.now();
+    }, 10);
     try {
       expect((await call(c, "Glob", { pattern: EVIL, path: "/repos/acme/redos" })).text).toBe("No files found");
       expect((await call(c, "Grep", { pattern: "x", glob: EVIL, path: "/repos/acme/redos" })).text).toBe("No files found");
       expect((await call(c, "Glob", { pattern: `/repos/acme/redos/**/${EVIL}` })).text).toBe("No files found");
     } finally {
       clearInterval(timer);
+      maxGap = Math.max(maxGap, Date.now() - last);
     }
     expect(Date.now() - t0).toBeLessThan(3000);
-    expect(ticks).toBeGreaterThan(0); // the event loop kept running
+    expect(maxGap).toBeLessThan(1000); // the event loop kept running
   });
 
   it("the exclude probe still applies user globs (rg semantics)", async () => {

@@ -54,15 +54,17 @@ Architecture, file map, deploy steps and verification evidence: `docs/BUILD-REPO
 7. **Confirm before anything outward-facing:** pushing, force-pushing, changing repo visibility,
    posting on PRs.
 
-## 3. Current state (verified at the end of the cloud session)
+## 3. Current state (cloud session, then a local fix pass on 2026-11-10)
 
-- **Git:** branch `main`. This file was added in the latest commit, which holds the whole build.
-  There is no remote yet.
+- **Git:** branch `main`. `origin` is `dudibuilds/claude-review` (public); `main` was first pushed
+  on 2026-11-10.
 - **Checks:**
   - `npm run build` passes.
   - `npm run typecheck` passes; it covers `src/` and `test/` via `tsconfig.test.json`.
-  - `npx vitest run`: 14 files, 843 passed and 4 skipped. The skipped ones are the Docker tests.
-  - With `XREPO_TEST_DOCKER_IMAGE=<image>`, all 847 pass.
+  - `npx vitest run`: 14 files, 942 passed and 5 skipped (macOS, Node 24, git 2.50, ripgrep 15).
+    Four skipped tests need Docker and one needs `pandoc`.
+  - The Docker tests and the Docker image have not been run since the fix pass (no Docker on that
+    machine). The CI `image` job is the first check of the new ubuntu:24.04 runtime base.
 - **Docker sandbox:** checked inside the container with the production flags. It runs as user
   65534, has no capabilities, only the loopback interface (outbound fails), a read-only root, and
   `/tmp` mounted noexec. ripgrep 14.1 and git 2.43 are present.
@@ -83,6 +85,24 @@ review lenses with adversarial verification, fixers, re-integration and a final 
 - Round 2 confirmed 44 findings, 2 of them high severity.
 - Almost all were fixed. What is left is in section 6.
 
+**Local fix pass (2026-11-10).** An audit of the build found eight problems. All were fixed and
+independently reviewed over seven fix-and-review rounds:
+- the publisher takes the PR identity from the workflow (`--repo`, `--pr-number`, `--head-sha`),
+  refuses an artifact that disagrees, and checks the approve gates against GitHub's own file list;
+- no review is posted unless the reviewed commit is still the PR head, and an older run never
+  republishes over a newer one (hidden run marker);
+- a finished draft is always `completed`, and usage-limit detection needs structured status or
+  the CLI's own phrases;
+- mention and fence bypasses in the sanitiser are closed;
+- the two-dot diff fallback is used only when base is an ancestor of head;
+- sync no longer retires a repo after a case-only rename;
+- redaction covers more token formats and the default deny globs more credential files (an
+  unquoted-YAML password rule was tried and removed, because it redacted ordinary code);
+- the default image is ubuntu:24.04 (ripgrep 14.1, git 2.43), and the timing-flaky glob test is
+  fixed.
+
+What the reviewers left as follow-ups is at the end of section 6.
+
 ## 4. Set up on this machine (macOS)
 
 ```bash
@@ -91,7 +111,7 @@ cd ~/claude-review                   # wherever the bundle was cloned
 npm ci
 npm run build
 npm run typecheck
-npx vitest run                       # expect 843 passed, 4 skipped
+npx vitest run                       # expect 942 passed, 5 skipped
 ```
 
 Notes:
@@ -101,27 +121,18 @@ Notes:
 - **Docker tests** need Docker Desktop:
   ```bash
   docker build -f docker/Dockerfile -t xrepo-review:dev .
-  XREPO_TEST_DOCKER_IMAGE=xrepo-review:dev npx vitest run   # expect 847 passed
+  XREPO_TEST_DOCKER_IMAGE=xrepo-review:dev npx vitest run   # the 4 Docker tests then run too
   ```
   The cloud build needed sandbox-only workarounds that you should not need: base images from
-  `mirror.gcr.io`, a `RUNTIME_IMAGE` build argument and an `npm_ca` build secret. The default
-  Dockerfile path is unchanged.
+  `mirror.gcr.io` and an `npm_ca` build secret. The default runtime base is now ubuntu:24.04
+  (`RUNTIME_IMAGE`), for ripgrep 14.1 and git 2.43 (Debian 12 has ripgrep 13 and git 2.39, which
+  lacks `--attr-source`); the CI image job asserts ripgrep >= 14.1 and git >= 2.43.
 - Engines say Node >= 20, but only Node 22 was tested.
 
 ## 5. Next steps, in order
 
-1. **Push to GitHub.** The cloud session was refused (403) by GitHub, so this has never been
-   pushed.
-   - `dudibuilds/claude-review` is **public**. Ask the user whether to make it private first.
-   - Check what is already there: `git ls-remote https://github.com/dudibuilds/claude-review.git`.
-     It may hold an initial commit.
-   - Then:
-     ```bash
-     git remote add origin https://github.com/dudibuilds/claude-review.git
-     git push -u origin main
-     ```
-     If the remote has unrelated history, use `--force-with-lease` **only after the user
-     confirms**.
+1. **Push to GitHub.** Done on 2026-11-10: `main` is on `dudibuilds/claude-review`, which the user
+   chose to keep public (see `AGENTS.md`).
 2. **Secrets.** The user runs `gh secret set CLAUDE_CODE_OAUTH_TOKEN -R dudibuilds/claude-review`.
 3. **Real GitHub e2e (hosted mode).** Follow README "Testing on GitHub".
    - The README's `sed -i` line is GNU syntax; on macOS use `sed -i ''`, or edit the file directly.
@@ -186,6 +197,24 @@ Notes:
 - **The default `github-actions[bot]` identity** is shared with other workflows. A GitHub App token
   with `--self-login` is better.
 
+### Follow-ups from the 2026-11-10 fix pass (reviewed, judged non-blocking)
+- **Sanitiser:** a `</details>` inside a tilde fence nested in a list item or blockquote is kept
+  as a tag, so the `<details>` can stay open over the publisher's footer. The hand-written
+  Markdown sanitiser produced a new bypass in almost every review round; stripping all raw HTML
+  would remove this whole class.
+- **Publisher:** when posting the review fails, an approving plan still posts a `success` check
+  titled "Approved" (the job exits 1). `listPullRequestFiles` validates line counts but not file
+  names. `verifyReviewHead` with an empty head sha skips the read (not reachable from
+  `xrepo publish`). A failed freshness read still means "publish as usual".
+- **Classify:** an accepted phrase inside a sentence about the code under review still counts as
+  a usage limit. The API's status-less `"rate_limit_error"` JSON and the old CLI wording
+  "5-hour limit reached" (CLI 1.0.89 to 1.0.113) now classify as `error`.
+- **Prepare:** a shallow probe that exits 0 with unexpected output is treated as shallow but has
+  no test, and its error text blames a shallow checkout.
+- **Deny globs:** a file named plain `kubeconfig`, or `kubeconfig.json`, stays readable.
+- **Redaction:** unquoted YAML values, and quoted passwords with a space or kebab words, are not
+  redacted. The deny globs are the protection.
+
 ### Docs to double-check
 - `docs/RESEARCH.md` says t3code exposes ~72 MCP tools; `docs/TOOLS.md` calls it a control surface
   with no code-navigation tools. Both may be true; neither could be re-checked offline.
@@ -203,7 +232,7 @@ Notes:
    45-minute timeout if that changes.
 6. **actionlint** in CI: yes or no?
 7. **Rename** to `claude-review` (section 5, step 7).
-8. **Repo visibility:** public or private.
+8. **Repo visibility:** decided on 2026-11-10: public (recorded in `AGENTS.md`).
 
 ## 8. Gotchas learned the hard way
 
@@ -215,7 +244,9 @@ Notes:
 - **Mentions:** a zero-width space after `@` neutralises it, including in inline code and in
   `_@user_` emphasis. The sanitiser does this; don't "clean it up".
 - **Review markers:** every review body ends with `<!-- xrepo-review:review -->`. Dismissals only
-  touch our own marked reviews, or the exact legacy wording.
+  touch our own marked reviews, or the exact legacy wording. Review bodies and the sticky also
+  carry `<!-- xrepo-review:run=<id> -->` (read only at the end of the body), so an older run
+  re-run later never republishes over a newer run.
 - **macOS:**
   - Terminal can't read `~/Downloads` or `~/Desktop` without permission (TCC). Move files to the
     home folder, or give Terminal Full Disk Access.

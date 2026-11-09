@@ -102,7 +102,7 @@ const ctx: PrContext = {
   author: "dev",
   author_type: "User",
   base_sha: "b".repeat(40),
-  head_sha: "h".repeat(40),
+  head_sha: "c".repeat(40),
   base_ref: "main",
   head_ref: "feature",
   draft: false,

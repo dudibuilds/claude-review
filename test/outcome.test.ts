@@ -274,6 +274,42 @@ describe("classifyOutcome", () => {
       reason: "the agent ended without calling finish()",
     },
     {
+      name: "a finished review followed by a trailing overload error is still completed",
+      input: {
+        agentStepOutcome: "failure",
+        draft: draft({
+          comments: [{ type: "comment", path: "a.ts", line: 1, body: "x", severity: "critical" }],
+          verdict: { type: "verdict", verdict: "request_changes", reason: "critical finding" },
+          finished: true,
+        }),
+        executionFileText: pretty([
+          INIT,
+          toolUse(),
+          toolResult("finished"),
+          {
+            type: "assistant",
+            message: { model: "<synthetic>", role: "assistant", content: [{ type: "text", text: "API Error: 529 Overloaded" }] },
+            error: "overloaded",
+          },
+          result({ subtype: "error_during_execution", is_error: true, result: undefined, api_error_status: 529, errors: ["API Error: 529 Overloaded"] }),
+        ]),
+      },
+      outcome: "completed",
+      reason: "review finished",
+    },
+    {
+      name: "a number or word in a path inside errors[] is not a usage limit",
+      input: {
+        agentStepOutcome: "failure",
+        executionFileText: pretty([
+          INIT,
+          result({ subtype: "error_during_execution", is_error: true, errors: ["ENOENT: src/quota/limits.ts line 429 not found (overloaded/rate_limit.ts)"] }),
+        ]),
+      },
+      outcome: "error",
+      reason: /^the agent failed during execution: ENOENT/,
+    },
+    {
       name: "finished draft -> completed",
       input: { agentStepOutcome: "success", draft: FINISHED, executionFileText: pretty([INIT, result({})]) },
       outcome: "completed",
@@ -446,18 +482,66 @@ describe("usage-limit patterns and reset parsing", () => {
     "Fable 5 requires usage credits",
     "Weekly limit reached ∙ resets Mon 9am",
     "rate limit exceeded",
+    "The request was rate limited.",
     "HTTP 429 Too Many Requests",
-    "quota exceeded",
-    "Overloaded",
+    "API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"message\":\"This request would exceed your organization's rate limit of 40,000 input tokens per minute\"}}",
+    "API Error: 529 status code (no body)",
+    "API Error: 529 Overloaded",
+    "API Error: Repeated 529 Overloaded errors",
+    'API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}',
+    'API Error: {"type":"error","error":{"details":null,"type":"overloaded_error","message":"Overloaded"},"request_id":null}',
+    "You have reached your specified API usage limits. You will regain access on 2026-12-01 at 00:00 UTC.",
     "Credit balance is too low",
   ])("matches %j", (text) => {
     expect(matchesUsageLimit(text)).toBe(true);
   });
 
   it("does not match ordinary failures", () => {
-    for (const t of ["Reached maximum number of turns (40)", "MCP server xsearch failed to start", "Invalid API key"]) {
+    for (const t of [
+      "Reached maximum number of turns (40)",
+      "MCP server xsearch failed to start",
+      "Invalid API key",
+      "src/quota/limits.ts line 429 not found",
+      "cannot read src/rate_limit/overloaded.ts (529 bytes)",
+      "src/usage_limit.ts: syntax error",
+      "ENOENT: no such file or directory, open 'src/errors/overloaded_error.ts'",
+    ]) {
       expect(matchesUsageLimit(t)).toBe(false);
     }
+  });
+
+  it("a failed run whose message only mentions rate limit / usage limit / limit reached is an error", () => {
+    for (const t of [
+      "Cannot find module 'src/rate limit/index.ts'",
+      "TypeError: usageLimit is undefined in checkUsageLimit (src/usage limit.ts:12)",
+      "Error: limit reached flag never set in src/limitReached.ts",
+      "The PR adds a rate limit to /login but the review could not finish",
+      "Reviewing the usage limit banner: MCP server xsearch failed to start",
+      "Assertion failed: retry limit reached before the mock answered",
+      "API error handling for 429 responses lives in src/http.ts; tool call failed",
+      "quota exceeded check in src/billing.ts throws on null",
+      "API Error: 500 Internal server error",
+      "API Error: 4290 unknown",
+      "Error: session limit of 5 exceeded in src/session.ts",
+      "the weekly limit banner test failed: MCP server xsearch failed to start",
+      "Error: daily limit reached for free-tier users (tests/quota.spec.ts)",
+      "monthly limit reached flag is never reset in src/billing.ts",
+    ]) {
+      const cls = classifyOutcome({ agentStepOutcome: "failure", executionFileText: pretty([INIT, result({ is_error: true, result: t })]) });
+      expect(cls.outcome, t).toBe("error");
+    }
+  });
+
+  it("the module's own 'rate limit rejected' evidence text is preferred as the reason", () => {
+    const cls = classifyOutcome({
+      agentStepOutcome: "failure",
+      executionFileText: jsonl([
+        INIT,
+        { type: "rate_limit_event", rate_limit_info: { status: "rejected", rateLimitType: "five_hour" } },
+        { type: "assistant", message: { model: "<synthetic>", role: "assistant", content: [{ type: "text", text: "Usage credit limit" }] }, error: "rate_limit" },
+      ]),
+    });
+    expect(cls).toMatchObject({ outcome: "usage_limit", reason: "rate limit rejected (five_hour)" });
   });
 });
 

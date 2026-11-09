@@ -359,6 +359,15 @@ describe("sanitizeMarkdown: code blocks", () => {
   it("does not let a backtick-in-info line open a fence", () => {
     expectSafe("```a`b\n@user\n```");
   });
+
+  it("sees a fence opener whose info string holds U+2028/U+2029 (GitHub opens a fence there)", () => {
+    const tail = "hi @octocat ![p](https://evil.example/x.png) [click](https://evil.example/)";
+    const safeTail = `hi @${Z}octocat ${Z}(image: p) ${Z}click (evil.example)`;
+    expect(clean(`\`\`\`a\u2028\nx\n\`\`\`\n${tail}\n\`\`\``)).toBe(`\`\`\`a\u2028\nx\n\`\`\`\n${safeTail}\n\`\`\`\n\`\`\``);
+    expect(clean(`~~~a\u2029\nx\n~~~\n${tail}\n~~~`)).toBe(`~~~a\u2029\nx\n~~~\n${safeTail}\n~~~\n~~~`);
+    // Indented: the opener is broken, so GitHub too sees the tail inside the column-0 fence.
+    expect(clean(` \`\`\`a\u2028\nx\n\`\`\`\n${tail}\n\`\`\``)).toBe(` \`\`${Z}\`a\u2028\nx\n\`\`\`\n${tail}\n\`\`\``);
+  });
 });
 
 describe("sanitizeMarkdown: secrets, controls, truncation", () => {
@@ -636,6 +645,111 @@ describe("sanitizeMarkdown: underscore-emphasis mentions (underscore-emphasis-me
   });
 });
 
+describe("sanitizeMarkdown: mentions hidden in kept URLs (protected-url-mention-bypass)", () => {
+  it("keeps an allowlisted bare URL with '@' only as an angle autolink (GitHub may not link the bare form)", () => {
+    // GFM does not autolink "www." after a letter, nor any URL inside an HTML block: the text would ping.
+    expect(clean("see awww.github.com/@victim ok")).toBe("see a<http://www.github.com/%40victim> ok");
+    expect(clean("x awww.github.com/@org/team.")).toBe("x a<http://www.github.com/%40org/team>.");
+    expect(clean("<details>\nhttps://github.com/@victim\n</details>")).toBe("<details>\n<https://github.com/%40victim>\n</details>");
+    expect(clean("a.https://github.com/@victim")).toBe("a.<https://github.com/%40victim>");
+    expect(clean("profile https://github.com/@user ok")).toBe("profile <https://github.com/%40user> ok");
+    // Without "@" nothing changes; in a code span the URL is defanged and the mention broken (invisible).
+    expect(clean("see https://github.com/acme/api/blob/main/a.ts")).toBe("see https://github.com/acme/api/blob/main/a.ts");
+    expect(vis("`https://github.com/@victim`")).toBe("`https:^//github.com/@^victim`");
+  });
+
+  it("keeps the text before a bare URL's scheme outside the protected link (mention and defang passes see it)", () => {
+    // GitHub links from "https" only: "@victim." in front is plain text and would ping.
+    expect(clean("hi @victim.https://github.com/x ok")).toBe(`hi @${Z}victim.https://github.com/x ok`);
+    expect(clean("hi @victim+https://github.com/x ok")).toBe(`hi @${Z}victim+https://github.com/x ok`);
+    expect(clean("hi @victim1https://github.com/x ok")).toBe(`hi @${Z}victim1https://github.com/x ok`);
+    expect(clean("@org/team.https://github.com/@x")).toBe(`@${Z}org/team.<https://github.com/%40x>`);
+    // A "www." in the prefix would be autolinked to a host outside the allowlist.
+    expect(clean("www.evil.com.https://github.com/@x")).toBe(`www${Z}.evil.com.<https://github.com/%40x>`);
+    expect(clean("www.evil.com.https://github.com/x")).toBe(`www${Z}.evil.com.https://github.com/x`);
+    // An "@" right before any protected construct is broken too (invisible).
+    expect(clean("@https://github.com/x")).toBe(`@${Z}https://github.com/x`);
+  });
+
+  it("percent-encodes '@' in kept relative and fragment destinations (text where the link does not parse)", () => {
+    expect(clean("<details>\n[x](./@victim)\n</details>")).toBe("<details>\n[x](<./%40victim>)\n</details>");
+    expect(clean("<details>\n[x](#@victim)\n</details>")).toBe("<details>\n[x](<#%40victim>)\n</details>");
+    expect(clean("[[a](https://github.com/x)](./@victim)")).toBe("[[a](<https://github.com/x>)](<./%40victim>)");
+    expect(clean("<pre>\n\n[x]: ./@victim\n</pre>")).toBe("<pre>\n\n[x]: <./%40victim>\n</pre>");
+    expect(clean("[a](https://github.com/@user)")).toBe("[a](<https://github.com/%40user>)");
+  });
+
+  it("never keeps a '|' in a URL or alt text: a GFM table cell boundary would cut it and expose the rest", () => {
+    const row = (cell: string, o: Partial<SanitizeOptions> = {}): string => clean(`| a | b |\n|---|---|\n| ${cell} | y |`, o).split("\n")[2] ?? "";
+    expect(row("https://github.com/x|@octocat")).toBe(`| https://github.com/x|@${Z}octocat | y |`);
+    expect(row("https://github.com/x|https://evil.com")).toBe(`| https://github.com/x|https:${Z}//evil.com | y |`);
+    expect(row("[x](https://github.com/a|@octocat)")).toBe("| [x](<https://github.com/a%7C%40octocat>) | y |");
+    expect(row("<https://github.com/a|@octocat>")).toBe("| <https://github.com/a%7C%40octocat> | y |");
+    expect(row('<img src="https://github.com/a|b.png" alt="x|@octocat">', { allowImages: true })).toBe(
+      `| <img src="https://github.com/a%7Cb.png" alt="x @${Z}octocat"> | y |`,
+    );
+  });
+
+  it("percent-encodes quotes in kept hrefs, so an HTML block cannot read one as a tag with an open attribute value", () => {
+    const tail = "\n</details>\n\nTRUSTED-FOOTER-1";
+    expect(clean(`<details>\nhttps://github.com/a='@octocat${tail}`)).toBe(`<details>\n<https://github.com/a=%27%40octocat>${tail}`);
+    expect(clean(`<details>\n<https://github.com/a="x>${tail}`)).toBe(`<details>\n<https://github.com/a=%22x>${tail}`);
+    expect(clean(`<details>\n[x](https://github.com/a'x)${tail}`)).toBe(`<details>\n[x](<https://github.com/a%27x>)${tail}`);
+  });
+
+  it("drops a kept '<...>' that truncation cuts open (its '@' would be text, or a tag swallowing what follows)", () => {
+    const o = { maxChars: 300 };
+    const tail = "?" + "a".repeat(400);
+    expect(clean(`review text here https://github.com/x/@octocat${tail}`, o)).toBe("review text here \n\n" + clean("x".repeat(400), o).split("\n\n")[1]);
+    expect(clean(`review text here [x](https://github.com/x/@octocat${tail})`, o)).toMatch(/^review text here \[x\]\(\n\n/);
+    const x = "x".repeat(250);
+    expect(safeCut(`${x}<https://github.com/x/@octocat?aaaaaaaaaa>`, 280)).toBe(x);
+    expect(safeCut('x <img src="https://github.com/@octocat.png" alt="b">', 42)).toBe("x ");
+    expect(safeCut("a <https://github.com/x> b", 25)).toBe("a <https://github.com/x>");
+  });
+
+  it("breaks a backslash right before a kept construct (it would escape the '<' and show the '@' as text)", () => {
+    expect(vis("[\\https://github.com/@victim")).toBe("[\\^<https://github.com/%40victim>");
+    expect(vis("[a\\www.github.com/@victim")).toBe("[a\\^<http://www.github.com/%40victim>");
+    expect(vis("[\\<https://github.com/@victim>")).toBe("[\\^<https://github.com/%40victim>");
+    expect(vis("\\<https://github.com/@victim>" + "b".repeat(300), { maxChars: 60 })).toMatch(/^\\\^<https:\^\/\/github\.com\/%40victim>b/);
+    expect(vis('\\<img src="https://github.com/a.png" alt="@victim">', { allowImages: true })).toBe(
+      '\\^<img src="https://github.com/a.png" alt="@^victim">',
+    );
+  });
+
+  it("never keeps an '@' in a kept construct (shown as text where GitHub does not parse it, e.g. math)", () => {
+    // A trailing backslash inside a kept bare URL escapes the next kept '<'.
+    expect(clean("[https://github.com/x\\<https://github.com/@victim>")).toBe(`[https://github.com/x\\${Z}<https://github.com/%40victim>`);
+    expect(clean("[awww.github.com/x\\<https://github.com/@victim>")).toBe(`[awww.github.com/x\\${Z}<https://github.com/%40victim>`);
+    expect(clean('[https://github.com/x\\<img src="https://github.com/a.png" alt="@victim">', { allowImages: true })).toBe(
+      `[https://github.com/x\\${Z}<img src="https://github.com/a.png" alt="@${Z}victim">`,
+    );
+    // Math fences nested in a list item or blockquote are prose to the sanitizer, text with live mentions on GitHub.
+    expect(clean("> ~~~math\n> https://github.com/@victim\n> ~~~")).toBe("> ~~~math\n> <https://github.com/%40victim>\n> ~~~");
+    expect(clean("- a\n  ~~~math\n  <https://github.com/@victim>\n  ~~~")).toBe("- a\n  ~~~math\n  <https://github.com/%40victim>\n  ~~~");
+    expect(clean("- a\n  ~~~math\n  [x](https://github.com/@victim)\n  ~~~")).toBe("- a\n  ~~~math\n  [x](<https://github.com/%40victim>)\n  ~~~");
+    // Inline $`...`$ math where the code-span guess is wrong.
+    expect(clean('<a title="`"> $`x <https://github.com/@victim> y`$')).not.toContain("/@victim");
+    expect(clean("- `\n- $`x https://github.com/@victim y`$")).toBe("- `\n- $`x <https://github.com/%40victim> y`$");
+  });
+
+  it("turns a top-level math fence into plain text (GitHub renders math with live mentions and references)", () => {
+    expect(clean("```math\n@victim\n```")).toBe("```text\n@victim\n```");
+    expect(clean("~~~math\n@victim\n~~~")).toBe("~~~text\n@victim\n~~~");
+    expect(clean("``` math x\nfixes #1\n```")).toBe("```text\nfixes #1\n```");
+    // GitHub decodes entities and escapes in the info string.
+    expect(clean("```m&#97;th\n@victim\n```")).toBe("```text\n@victim\n```");
+    expect(clean("```ts\n@victim\n```")).toBe("```ts\n@victim\n```");
+  });
+
+  it("breaks an '@' behind a semicolon-less entity name (an HTML block decodes '&amp@user' to '&@user')", () => {
+    expect(clean("<details>\nhi&amp@victim\n</details>")).toBe(`<details>\nhi&amp@${Z}victim\n</details>`);
+    expect(clean("&copy@victim")).toBe(`&copy@${Z}victim`);
+    expect(clean("mail a@b.com")).toBe("mail a@b.com");
+  });
+});
+
 describe("sanitizeMarkdown: unbalanced allowed tags (unbalanced-details-hides-trusted-text)", () => {
   const FOOTER = "TRUSTED-FOOTER-7f3a";
 
@@ -686,6 +800,14 @@ describe("sanitizeMarkdown: unbalanced allowed tags (unbalanced-details-hides-tr
     expect(vis("</details> x </sub>")).toBe("^ x ^");
     // Tags inside code spans are text, never matched.
     expect(vis("`<details>` <sub>x `</sub>`")).toBe("`<^details>` ^x `<^/sub>`");
+  });
+
+  it("keeps a backslash ending a kept bare URL from escaping the next kept closer", () => {
+    const s = "<details><summary>all good</summary>\n\nsee awww.github.com/x\\</details>";
+    const md = `${clean(s)}\n\n${FOOTER}`;
+    expect(md).toBe(`<details><summary>all good</summary>\n\nsee awww.github.com/x\\${Z}</details>\n\n${FOOTER}`);
+    if (HAS_PANDOC) expect(openTagsAt(md, FOOTER)).toEqual([]);
+    expect(vis("[see https://github.com/x\\</details>")).toBe("[see https://github.com/x\\^^");
   });
 
   it("balances what is left after truncation", () => {

@@ -14,7 +14,7 @@
  * Writes (SPEC "On-disk layout"):
  *   <work>/agent/mcp.json              the two stdio MCP servers (xsearch, xreview); nothing else
  *   <work>/ctx/pr.json                 PR context (from the event JSON + git)
- *   <work>/ctx/diff.patch              `git diff base...head` (fallbacks: two-dot diff, GitHub API)
+ *   <work>/ctx/diff.patch              `git diff base...head` (fallback: GitHub API)
  *   <work>/ctx/policy.resolved.json    resolved policy for this repository
  *   <work>/out/draft.jsonl             empty; the only file xreview writes
  *   <work>/prompt.md, claude_args.txt  copies of the step outputs (debugging; outside agent/)
@@ -91,6 +91,8 @@ import { discoverMirror, isMirrorRepoName, type MirrorRepoInfo } from "../search
 
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const SHA_RE = /^[0-9a-f]{7,64}$/i;
+/** The PR's base/head: full 40-hex shas, as ctx/pr.json requires (readContext rejects anything else). */
+const FULL_SHA_RE = /^[0-9a-f]{40}$/i;
 const MAX_EVENT_BYTES = 25 * 1024 * 1024;
 const MAX_DIFF_BYTES = 32 * 1024 * 1024;
 const GIT_TIMEOUT_MS = 120_000;
@@ -336,7 +338,7 @@ const DIFF_FORMAT_ARGS = [
   "--ignore-submodules=none",
 ];
 
-export function gitDiffArgs(base: string, head: string, threeDot: boolean, attrSource: boolean): string[] {
+export function gitDiffArgs(base: string, head: string, attrSource: boolean): string[] {
   if (!SHA_RE.test(base) || !SHA_RE.test(head)) throw new PrepareError("base/head must be hex commit SHAs");
   return [
     ...(attrSource ? [`--attr-source=${base}`] : []),
@@ -351,15 +353,14 @@ export function gitDiffArgs(base: string, head: string, threeDot: boolean, attrS
     "--find-renames",
     "--src-prefix=a/",
     "--dst-prefix=b/",
-    threeDot ? `${base}...${head}` : base,
-    ...(threeDot ? [] : [head]),
+    `${base}...${head}`,
     "--",
   ];
 }
 
 export interface DiffResult {
   text: string;
-  method: "three-dot" | "two-dot" | "api";
+  method: "three-dot" | "api";
   /** The diff is too large to use (text is empty); `overflowLimit` says which limit. */
   overflow?: boolean;
   /**
@@ -421,9 +422,12 @@ function apiToken(env: NodeJS.ProcessEnv): string | undefined {
 }
 
 /**
- * Unified diff base...head: `git diff base...head` (merge-base diff, what GitHub shows), else
- * `git diff base head`, else the GitHub API (`application/vnd.github.v3.diff`, token from
- * GITHUB_TOKEN / GH_TOKEN).
+ * Unified diff base...head: `git diff base...head` (merge-base diff, what GitHub shows), else the
+ * GitHub API (`application/vnd.github.v3.diff`, token from GITHUB_TOKEN / GH_TOKEN). In a shallow
+ * checkout git finds the merge base on truncated history, which can be missing or wrong (phantom
+ * base-only files, hidden PR changes), so the local diff is used there only when base is a visible
+ * ancestor of head (the merge base is then base itself). Never `git diff base head`: it shows every
+ * base commit since the fork point as reverted by the PR.
  *
  * gitattributes never come from the PR: git >= 2.40 reads them from the base commit
  * (`--attr-source`); older git (no such option) runs in an isolated empty work tree and index, so
@@ -444,37 +448,43 @@ export async function computeDiff(input: {
   const env = input.env ?? process.env;
   const git = input.git ?? "git";
   const errors: string[] = [];
-  let iso: IsolatedGit | undefined;
-  try {
-    for (const threeDot of [true, false]) {
-      const method = threeDot ? "three-dot" : "two-dot";
-      const diffArgs = (attrSource: boolean): string[] => gitDiffArgs(input.base, input.head, threeDot, attrSource);
-      let res: ExecResult;
-      if (!iso) {
-        res = await execArgs(git, ["-C", input.prDir, ...diffArgs(true)], { maxBytes: MAX_DIFF_BYTES, env: gitEnv() });
-        if (res.overflow) return { text: "", method, overflow: true, attributes: "base" };
-        if (res.code === 0) return { text: res.stdout, method, attributes: "base" };
-        if (!attrSourceUnsupported(res)) {
-          errors.push(`git diff ${threeDot ? "base...head" : "base head"}: ${res.stderr.trim().split("\n")[0] ?? ""}`);
-          continue;
-        }
-        const made = await isolatedGit(git, input.prDir);
-        if (typeof made === "string") {
-          errors.push(`git does not support --attr-source and ${made}`);
-          break;
-        }
-        iso = made;
-        audit("prepare.attr_source_unsupported", {
-          warning: "git < 2.40 has no --attr-source; diffing without any repository gitattributes (isolated work tree and index)",
-        });
+  const diffArgs = (attrSource: boolean): string[] => gitDiffArgs(input.base, input.head, attrSource);
+  const args = diffArgs(true); // validates base/head before they reach any git command line
+  const shallow = await execArgs(git, ["-C", input.prDir, "rev-parse", "--is-shallow-repository"], { env: gitEnv(), timeoutMs: 30_000 });
+  const ancestor = async (): Promise<boolean> =>
+    (await execArgs(git, ["-C", input.prDir, "merge-base", "--is-ancestor", input.base, input.head], { env: gitEnv(), timeoutMs: GIT_TIMEOUT_MS })).code === 0;
+  // Not provably non-shallow: the local diff only when its merge base is provably base.
+  const res =
+    (shallow.code === 0 && shallow.stdout.trim() === "false") || (await ancestor())
+      ? await execArgs(git, ["-C", input.prDir, ...args], { maxBytes: MAX_DIFF_BYTES, env: gitEnv() })
+      : undefined;
+  if (res?.overflow) return { text: "", method: "three-dot", overflow: true, attributes: "base" };
+  if (res?.code === 0) return { text: res.stdout, method: "three-dot", attributes: "base" };
+  if (!res) {
+    errors.push(
+      shallow.code !== 0
+        ? `git rev-parse --is-shallow-repository: ${shallow.stderr.trim().split("\n")[0] ?? ""}`
+        : "shallow checkout and base is not an ancestor of head: the local merge base cannot be trusted",
+    );
+  } else if (!attrSourceUnsupported(res)) {
+    errors.push(`git diff base...head: ${res.stderr.trim().split("\n")[0] ?? ""}`);
+  } else {
+    const iso = await isolatedGit(git, input.prDir);
+    if (typeof iso === "string") {
+      errors.push(`git does not support --attr-source and ${iso}`);
+    } else {
+      audit("prepare.attr_source_unsupported", {
+        warning: "git < 2.40 has no --attr-source; diffing without any repository gitattributes (isolated work tree and index)",
+      });
+      try {
+        const r = await execArgs(git, isolatedArgs(iso, diffArgs(false)), { cwd: iso.dir, maxBytes: MAX_DIFF_BYTES, env: isolatedEnv(iso) });
+        if (r.overflow) return { text: "", method: "three-dot", overflow: true, attributes: "none" };
+        if (r.code === 0) return { text: r.stdout, method: "three-dot", attributes: "none" };
+        errors.push(`git diff base...head (no gitattributes): ${r.stderr.trim().split("\n")[0] ?? ""}`);
+      } finally {
+        rmSync(iso.dir, { recursive: true, force: true });
       }
-      res = await execArgs(git, isolatedArgs(iso, diffArgs(false)), { cwd: iso.dir, maxBytes: MAX_DIFF_BYTES, env: isolatedEnv(iso) });
-      if (res.overflow) return { text: "", method, overflow: true, attributes: "none" };
-      if (res.code === 0) return { text: res.stdout, method, attributes: "none" };
-      errors.push(`git diff ${threeDot ? "base...head" : "base head"} (no gitattributes): ${res.stderr.trim().split("\n")[0] ?? ""}`);
     }
-  } finally {
-    if (iso) rmSync(iso.dir, { recursive: true, force: true });
   }
   audit("prepare.git_diff_failed", { errors });
 
@@ -593,8 +603,8 @@ export function prInfoFromPullRequest(pr: unknown): PrEventInfo | undefined {
     body: str(pr.body) ?? "",
     author: login,
     authorType,
-    ...(str(base.sha) && SHA_RE.test(str(base.sha)!) ? { baseSha: str(base.sha)!.toLowerCase() } : {}),
-    ...(str(head.sha) && SHA_RE.test(str(head.sha)!) ? { headSha: str(head.sha)!.toLowerCase() } : {}),
+    ...(str(base.sha) && FULL_SHA_RE.test(str(base.sha)!) ? { baseSha: str(base.sha)!.toLowerCase() } : {}),
+    ...(str(head.sha) && FULL_SHA_RE.test(str(head.sha)!) ? { headSha: str(head.sha)!.toLowerCase() } : {}),
     baseRef: str(base.ref) ?? "",
     headRef: str(head.ref) ?? "",
     draft: pr.draft === true,
@@ -1658,7 +1668,7 @@ async function prepare(
   }
   const baseSha = ((v["base-sha"] as string | undefined)?.trim() || info.baseSha || "").toLowerCase();
   const headSha = ((v["head-sha"] as string | undefined)?.trim() || info.headSha || "").toLowerCase();
-  if (!SHA_RE.test(baseSha) || !SHA_RE.test(headSha)) throw new PrepareError("base/head SHA unknown or invalid: pass --base-sha/--head-sha (hex)");
+  if (!FULL_SHA_RE.test(baseSha) || !FULL_SHA_RE.test(headSha)) throw new PrepareError("base/head SHA unknown or invalid: pass --base-sha/--head-sha (full 40-hex)");
 
   const policy = resolvePolicy(loadPolicy(policyReal), repo);
 

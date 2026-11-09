@@ -100,7 +100,7 @@ The repo builds and type-checks cleanly. The full test suite passes (847 of 847 
 ## 4. Deploy steps
 
 1. Set up a dedicated, ephemeral self-hosted runner group with Docker, git and Node 22, labelled `xrepo-review`.
-2. Build the image with a pinned base: `docker build -f docker/Dockerfile --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> -t xrepo-review:latest .`. Install the CLI with `npm ci && npm run build && npm install -g .`, or pass `xrepo_ref` and let the workflow build both.
+2. Build the image with a pinned base: `docker build -f docker/Dockerfile --build-arg NODE_IMAGE=node:22-bookworm-slim@sha256:<digest> --build-arg RUNTIME_IMAGE=ubuntu:24.04@sha256:<digest> -t xrepo-review:latest .`. Install the CLI with `npm ci && npm run build && npm install -g .`, or pass `xrepo_ref` and let the workflow build both. The installed CLI and image must come from the same commit the callers pin `review.yml` to (or pass `xrepo_ref`): on a mismatch the publish job fails without publishing, because `xrepo publish` now requires `--repo` / `--pr-number`.
 3. Copy `examples/policy.yaml` to `/etc/xrepo-review/policy.yaml` (owner root, mode 0644). Check it with `xrepo policy validate` and `xrepo policy tools <file> <owner/repo>`.
 4. Create a GitHub App with contents:read and install it on every owner in `mirror.repos`. Set `vars.XREPO_APP_CLIENT_ID` and `secrets.XREPO_APP_PRIVATE_KEY`. Run `sync.yml` on an `xrepo-sync` runner on the review host, or a systemd timer (one `--owner` run per owner).
 5. Optional retries: a second App with actions:write and pull-requests:write, then `retry.yml`. Variables: `XREPO_CALLER_WORKFLOW`, `XREPO_PUBLISHER_LOGIN`, `XREPO_RETRY_OWNERS`.
@@ -116,7 +116,7 @@ The repo builds and type-checks cleanly. The full test suite passes (847 of 847 
 
 - **Build and type-check:** `npm run build` passes. `npm run typecheck` (source and tests) passes, and so does `npx tsc --noEmit -p .`.
 - **Tests:** without Docker, 843 passed and 4 skipped (the Docker tests) across 14 files. With `XREPO_TEST_DOCKER_IMAGE=xrepo-review:final`, 847 of 847 passed. One new test covers `--help`.
-- **Docker image:** rebuilt as `xrepo-review:final`. The base images came from `mirror.gcr.io` (node, plus `ubuntu:24.04` as the runtime base) and npm used the proxy CA as a build secret. These are sandbox workarounds; the default build is unchanged. Checks inside the container with the production flags:
+- **Docker image:** rebuilt as `xrepo-review:final`. The base images came from `mirror.gcr.io` (node, plus `ubuntu:24.04` as the runtime base) and npm used the proxy CA as a build secret. The mirror and the CA were sandbox workarounds; ubuntu:24.04 has since become the default runtime base (ripgrep 14.1, git 2.43). Checks inside the container with the production flags:
   - user is `nobody` (65534);
   - no capabilities (`CapEff` 0) and no-new-privileges is on;
   - only the `lo` network interface, and outbound fetch fails;

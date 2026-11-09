@@ -2,9 +2,9 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { PrContext } from "../src/common/context.js";
+import { PrContext } from "../src/common/context.js";
 import { parsePolicy, resolvePolicy } from "../src/policy/load.js";
-import type { CheckRunInput, CreateReviewResult, GitHubApi, GitHubApiOptions, IssueCommentRef } from "../src/publish/github.js";
+import { StaleHeadError, type CheckRunInput, type CreateReviewOptions, type CreateReviewResult, type GitHubApi, type GitHubApiOptions, type IssueCommentRef, type PullRequestFile } from "../src/publish/github.js";
 import type { PlanReview } from "../src/publish/plan.js";
 import { parseRetryAfterMarkers, parseRetryMarkers, decideRetry, retryLimit, retryRules, retryTiming } from "../src/outcome/retry.js";
 import { repositoryDispatch } from "../src/outcome/dispatch.js";
@@ -137,6 +137,8 @@ const EXEC_MAX_TURNS = JSON.stringify([
 interface FakeGitHub extends GitHubApi {
   calls: { method: string; args: unknown[] }[];
   sticky?: IssueCommentRef;
+  /** What GitHub lists as the PR's changed files (default: CTX.files). */
+  files: PullRequestFile[];
   fail: Set<string>;
   opts?: GitHubApiOptions;
 }
@@ -146,6 +148,7 @@ function fakeGitHub(init: { sticky?: IssueCommentRef; fail?: string[] } = {}): F
     calls: [],
     fail: new Set(init.fail ?? []),
     ...(init.sticky ? { sticky: init.sticky } : {}),
+    files: CTX.files.map((f) => ({ path: f.path, additions: f.additions, deletions: f.deletions })),
     async listReviewCommentKeys() {
       rec("listReviewCommentKeys", []);
       return new Set<string>();
@@ -161,9 +164,17 @@ function fakeGitHub(init: { sticky?: IssueCommentRef; fail?: string[] } = {}): F
     async updateIssueComment(id: number, body: string) {
       rec("updateIssueComment", [id, body]);
     },
-    async createReview(r: PlanReview): Promise<CreateReviewResult> {
-      rec("createReview", [r]);
+    async createReview(r: PlanReview, opts?: CreateReviewOptions): Promise<CreateReviewResult> {
+      rec("createReview", opts?.withholdApproval !== undefined ? [r, opts] : [r]);
+      // Like github.ts: an approval the caller withholds is posted as a COMMENT.
+      if (r.event === "APPROVE" && opts?.withholdApproval !== undefined) {
+        return { id: 2, inlineFallback: false, event: "COMMENT", downgraded: { from: "APPROVE", reason: opts.withholdApproval, withheld: true } };
+      }
       return { id: 2, inlineFallback: false };
+    },
+    async listPullRequestFiles() {
+      rec("listPullRequestFiles", []);
+      return gh.files;
     },
     async createCheckRun(c: CheckRunInput) {
       rec("createCheckRun", [c]);
@@ -438,7 +449,7 @@ describe("xrepo publish: incomplete / usage_limit / error / skipped", () => {
     const [[body]] = callsOf(r.gh, "createIssueComment") as [[string]];
     expect(body).toBe(
       `${STICKY}\n⚠️ Automated review could not run (the review job failed before the agent ran (review context missing)). ` +
-        "This does not block merging. [Run log](https://github.com/acme/web/actions/runs/99)",
+        "This does not block merging. [Run log](https://github.com/acme/web/actions/runs/99)\n\n<!-- xrepo-review:run=99 -->",
     );
     expect((callsOf(r.gh, "createCheckRun")[0]?.[0] as CheckRunInput).conclusion).toBe("neutral");
     expect(r.outputs).toMatchObject({ outcome: "error", reason: "the review job failed before the agent ran (review context missing)", findings: "0" });
@@ -670,7 +681,7 @@ describe("retry-after marker in the sticky comment (retry-ignores-reset-time)", 
     const [[body]] = callsOf(r.gh, "createIssueComment") as [[string]];
     expect(body).toBe(
       `${STICKY}\n⏸️ Automated review postponed: Claude usage limit reached (resets 1:32pm (UTC)). This does not block merging.\n\n` +
-        "<!-- xrepo-review:retry-after 2023-11-15T13:37:00Z run=5551 attempt=1 -->",
+        "<!-- xrepo-review:retry-after 2023-11-15T13:37:00Z run=5551 attempt=1 -->\n<!-- xrepo-review:run=5551 -->",
     );
     // What the sweeper does with it: wait until the reset, then re-run.
     const markers = parseRetryAfterMarkers(body);
@@ -1024,7 +1035,7 @@ describe("retry-stop marker at an outcome's own max_attempts (retry-shared-label
     expect(r.code).toBe(0);
     expect(r.outputs.outcome).toBe("error");
     const [[body]] = callsOf(r.gh, "createIssueComment") as [[string]];
-    expect(body.endsWith("\n\n<!-- xrepo-review:retry-stop run=88 attempt=2 max=2 -->")).toBe(true);
+    expect(body.endsWith("\n\n<!-- xrepo-review:retry-stop run=88 attempt=2 max=2 -->\n<!-- xrepo-review:run=88 -->")).toBe(true);
     expect(body).not.toContain("retry-after");
     // The label stays (neither added nor removed) for the sweeper to give up and comment.
     expect(callsOf(r.gh, "addLabels")).toEqual([]);
@@ -1303,5 +1314,195 @@ describe("xrepo publish: a skip replaces an earlier sticky (stale-sticky-after-s
     expect(callsOf(r.gh, "createIssueComment")).toHaveLength(0);
     const again = await run(setup({ draft: null }), ["--skip-reason", 'title contains "[skip review]"'], { gh: fakeGitHub({ sticky: { id: 9, body } }) });
     expect(callsOf(again.gh, "updateIssueComment")).toHaveLength(0);
+  });
+});
+
+describe("xrepo publish: the PR identity comes from the workflow, not the artifact (publisher-trusts-artifact-pr-identity)", () => {
+  const APPROVING = BASE_POLICY.replace("labels: { enabled: true", "approve: { enabled: true, max_changed_lines: 10 }\n    labels: { enabled: true");
+  const TRUSTED = ["--repo", "acme/web", "--pr-number", "42", "--head-sha", HEAD];
+
+  it("a pr.json naming another pull request, repository or head publishes nothing and exits 1", async () => {
+    for (const [ctx, what] of [
+      [{ ...CTX, number: 43 }, "pull request #43, but this workflow runs for #42"],
+      [{ ...CTX, repo: "acme/other" }, "repository acme/other, but this workflow runs for acme/web"],
+      [{ ...CTX, head_sha: "c".repeat(40) }, "head commit cccccccccccc, but the event's head is aaaaaaaaaaaa"],
+    ] as const) {
+      const s = setup({ ctx, draft: [SUMMARY, verdict("approve"), FINISH] });
+      const r = await run(s, [...TRUSTED, "--agent-outcome", "success", "--plan-out", s.planOut], { noFactory: true });
+      expect(r.code, what).toBe(1);
+      expect(r.factoryCalls).toBe(0);
+      expect(r.fetch.calls).toHaveLength(0);
+      expect(r.stderr).toContain(`refusing to publish anything: ctx/pr.json names ${what}`);
+      expect(r.outputs).toEqual({});
+    }
+    // The same artifact with the matching identity publishes (repository names are case-insensitive).
+    const ok = await run(setup({ draft: [SUMMARY, FINISH] }), ["--repo", "ACME/web", "--pr-number", "42", "--head-sha", HEAD.toUpperCase(), "--agent-outcome", "success"]);
+    expect(ok.code).toBe(0);
+    expect(ok.gh.opts).toMatchObject({ repo: "ACME/web", prNumber: 42, headSha: HEAD });
+  });
+
+  it("the run link never comes from pr.json: --run-url, else the workflow's run", async () => {
+    const policy = `${BASE_POLICY}\n      notify: [{ target: hook }]\n`; // appended to outcomes.completed
+    const ctx = { ...CTX, run_url: "https://evil.example/acme/web/actions/runs/1" };
+    const env = { GITHUB_SERVER_URL: "https://github.com", GITHUB_REPOSITORY: "acme/web", GITHUB_RUN_ID: "77" };
+    const r = await run(setup({ policy, ctx, draft: [SUMMARY, FINISH] }), [...TRUSTED, "--agent-outcome", "success"], { env });
+    expect(r.fetch.calls[0]?.body).toMatchObject({ run_url: "https://github.com/acme/web/actions/runs/77" });
+    const none = await run(setup({ policy, ctx, draft: [SUMMARY, FINISH] }), [...TRUSTED, "--agent-outcome", "success", "--run-url", "javascript:x"]);
+    expect(none.fetch.calls[0]?.body).toMatchObject({ run_url: null });
+  });
+
+  it("validates the identity flags, and requires them in GitHub Actions", async () => {
+    const s = setup({ draft: [SUMMARY, FINISH] });
+    for (const bad of [
+      ["--repo", "acme", "--pr-number", "42"],
+      ["--repo", "acme/web", "--pr-number", "0"],
+      ["--repo", "acme/web", "--pr-number", "42", "--head-sha", HEAD.slice(0, 7)],
+      ["--pr-number", "42"],
+    ]) {
+      expect((await run(s, bad, { noFactory: true })).code, bad.join(" ")).toBe(2);
+    }
+    const actions = await run(s, ["--agent-outcome", "success"], { noFactory: true, env: { GITHUB_ACTIONS: "true" } });
+    expect(actions.code).toBe(2);
+    expect(actions.stderr).toContain("--repo and --pr-number are required in GitHub Actions");
+  });
+
+  it("pr.json's head_sha must be a full sha (never matched as a prefix)", () => {
+    expect(PrContext.safeParse({ ...CTX, head_sha: HEAD.slice(0, 7) }).success).toBe(false);
+    expect(PrContext.safeParse(CTX).success).toBe(true);
+  });
+
+  it("without pr.json the identity comes from the workflow (workflow_dispatch: no event PR)", async () => {
+    const DISPATCH = ["--repo", "acme/web", "--pr-number", "42", "--agent-outcome", "failure"];
+    // The head comes from GitHub; the client then reviews it, so freshness and the check apply.
+    const withHead = (freshness: { current: boolean; newer_run?: number }): FakeGitHub => {
+      const gh = fakeGitHub({ sticky: { id: 9, body: `${STICKY}\nnewer run's summary` } });
+      gh.getPullRequest = async () => ({ head_sha: HEAD.toUpperCase(), state: "open", draft: false, merged: false });
+      gh.dismissStaleApprovals = async (message: string) => {
+        gh.calls.push({ method: "dismissStaleApprovals", args: [message] });
+        return { dismissed: [5], failed: [] };
+      };
+      gh.runFreshness = async () => {
+        expect(gh.opts?.headSha).toBe(HEAD);
+        return { ...freshness, head_sha: HEAD, state: "open", ...(freshness.current ? {} : { reason: "workflow run 200 (newer than run 100) already published for this commit" }) };
+      };
+      return gh;
+    };
+    const fresh = await run(setup({ ctx: null, diff: null, draft: null }), DISPATCH, { gh: withHead({ current: true }) });
+    expect(fresh.code).toBe(0);
+    expect(fresh.gh.opts).toMatchObject({ repo: "acme/web", prNumber: 42, headSha: HEAD });
+    expect(fresh.outputs.outcome).toBe("error");
+    expect((callsOf(fresh.gh, "createCheckRun")[0]?.[0] as CheckRunInput).head_sha).toBe(HEAD);
+    expect(callsOf(fresh.gh, "updateIssueComment")).toHaveLength(1);
+    expect(callsOf(fresh.gh, "dismissStaleApprovals")).toHaveLength(1);
+    // An older run re-run later never publishes over the newer run's sticky.
+    const older = await run(setup({ ctx: null, diff: null, draft: null }), DISPATCH, { gh: withHead({ current: false, newer_run: 200 }), env: { GITHUB_RUN_ID: "100" } });
+    expect(older.code).toBe(0);
+    for (const m of ["createReview", "createIssueComment", "updateIssueComment", "dismissStaleApprovals"]) expect(callsOf(older.gh, m), m).toHaveLength(0);
+    // GitHub cannot be read: nothing is published.
+    const blind = fakeGitHub();
+    blind.getPullRequest = async () => {
+      throw new Error("503");
+    };
+    const r = await run(setup({ ctx: null, diff: null, draft: null }), DISPATCH, { gh: blind });
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("the pull request's head could not be read from GitHub");
+    expect(blind.calls).toEqual([]);
+    expect(r.outputs).toEqual({});
+  });
+
+  it("the PR link comes from the workflow's identity, never from pr.json", async () => {
+    const policy = `${BASE_POLICY}
+    completed:
+      notify: [{ target: chat, message: "Reviewed {pr_url}" }]
+      dispatch: { event_type: "xrepo-done" }
+`;
+    for (const forged of ["https://github.com/acme/web/pull/43", "https://evil.example/acme/web/pull/42"]) {
+      const s = setup({ policy: policy.replace("    completed:\n      remove_labels: [\"review-postponed\"]\n", ""), ctx: { ...CTX, html_url: forged }, draft: [SUMMARY, FINISH] });
+      const r = await run(s, [...TRUSTED, "--agent-outcome", "success"], { env: { GITHUB_SERVER_URL: "https://github.com/" } });
+      expect(r.code).toBe(0);
+      const [[, , payload]] = callsOf(r.gh, "repositoryDispatch") as [[string, string, Record<string, unknown>]];
+      expect(payload.pr_url).toBe("https://github.com/acme/web/pull/42");
+      const slack = r.fetch.calls.find((c) => c.url.startsWith("https://hooks.slack.example"));
+      expect(JSON.stringify(slack?.body)).toContain("Reviewed https://github.com/acme/web/pull/42");
+      expect(JSON.stringify(slack?.body)).not.toContain(forged);
+    }
+  });
+
+  it("without --head-sha, pr.json's head is used only once GitHub confirms it is the PR head", async () => {
+    const DISPATCH = ["--repo", "acme/web", "--pr-number", "42", "--agent-outcome", "success"];
+    // GitHub cannot be read: nothing is published.
+    const blind = fakeGitHub();
+    const r1 = await run(setup({ draft: [SUMMARY, FINISH] }), DISPATCH, { gh: blind });
+    expect(r1.code).toBe(1);
+    expect(r1.stderr).toContain("could not be confirmed as the pull request's head");
+    expect(blind.calls.filter((c) => c.method !== "listReviewCommentKeys")).toEqual([]);
+    // pr.json names a commit that is not the PR head (e.g. another PR's head): stale, and no check on it.
+    const moved = fakeGitHub();
+    moved.runFreshness = async () => ({ current: false, head_sha: "c".repeat(40), state: "open", reason: "moved" });
+    const r2 = await run(setup({ draft: [SUMMARY, FINISH] }), DISPATCH, { gh: moved });
+    expect(r2.code).toBe(0);
+    for (const m of ["createReview", "createCheckRun", "createIssueComment", "updateIssueComment"]) expect(callsOf(moved, m), m).toHaveLength(0);
+    // Confirmed: published as usual.
+    const confirmed = fakeGitHub();
+    confirmed.runFreshness = async () => ({ current: true, head_sha: HEAD, state: "open" });
+    const r3 = await run(setup({ draft: [SUMMARY, FINISH] }), DISPATCH, { gh: confirmed });
+    expect(r3.code).toBe(0);
+    expect(callsOf(confirmed, "createCheckRun")).toHaveLength(1);
+  });
+
+  it("approves only when the approve gates also hold on GitHub's own file list", async () => {
+    // The artifact's diff is tiny and harmless; GitHub lists a workflow change and 500 lines.
+    const gh = fakeGitHub();
+    gh.files = [
+      { path: "src/orders.ts", additions: 2, deletions: 0 },
+      { path: ".github/workflows/deploy.yml", previous_path: "ci/deploy.yml", additions: 400, deletions: 100 },
+    ];
+    const s = setup({ policy: APPROVING, draft: [SUMMARY, verdict("approve"), FINISH] });
+    const r = await run(s, [...TRUSTED, "--agent-outcome", "success", "--plan-out", s.planOut], { gh });
+    expect(r.code).toBe(0);
+    const [[review, opts]] = callsOf(gh, "createReview") as [[PlanReview, CreateReviewOptions]];
+    expect(review.event).toBe("APPROVE");
+    expect(opts.withholdApproval).toContain("on GitHub's file list:");
+    expect(opts.withholdApproval).toContain(".github/workflows/deploy.yml");
+    expect(opts.withholdApproval).toContain("502 changed lines exceed approve.max_changed_lines (10)");
+    expect(r.outputs).toMatchObject({ verdict: "comment", fired_outcomes: "completed" });
+    expect((callsOf(gh, "createCheckRun")[0]?.[0] as CheckRunInput).title).toContain("Approval withheld");
+    // A rename out of a never_paths directory counts too.
+    const renamed = fakeGitHub();
+    renamed.files = [{ path: "ci/deploy.yml", previous_path: ".github/workflows/deploy.yml", additions: 1, deletions: 0 }];
+    await run(setup({ policy: APPROVING, draft: [SUMMARY, verdict("approve"), FINISH] }), TRUSTED, { gh: renamed });
+    expect(String((callsOf(renamed, "createReview")[0] as [PlanReview, CreateReviewOptions])[1]?.withholdApproval)).toContain(".github/workflows/deploy.yml");
+    // An unreadable file list withholds it (fail closed); a matching one approves.
+    const blind = fakeGitHub({ fail: ["listPullRequestFiles"] });
+    const r2 = await run(setup({ policy: APPROVING, draft: [SUMMARY, verdict("approve"), FINISH] }), TRUSTED, { gh: blind });
+    expect(r2.outputs.fired_outcomes).toBe("completed");
+    const fine = await run(setup({ policy: APPROVING, draft: [SUMMARY, verdict("approve"), FINISH] }), TRUSTED);
+    expect(callsOf(fine.gh, "createReview")[0]).toHaveLength(1);
+    expect(fine.outputs.fired_outcomes).toBe("completed,approved");
+  });
+});
+
+describe("xrepo publish: stale runs never post a review (stale-run-posts-review)", () => {
+  it("a push after the freshness read: createReview posts nothing and the run is stale", async () => {
+    const BLOCKING = BASE_POLICY.replace("labels: { enabled: true", "block: { enabled: true, method: review, min_severity: high }\n    labels: { enabled: true");
+    const s = setup({ policy: BLOCKING, draft: [HIGH, SUMMARY, verdict("request_changes"), FINISH] });
+    const gh = fakeGitHub({ sticky: { id: 9, body: `${STICKY}\nold` } });
+    gh.runFreshness = async () => ({ current: true, head_sha: HEAD, state: "open" });
+    gh.createReview = async (r: PlanReview) => {
+      gh.calls.push({ method: "createReview", args: [r] });
+      throw new StaleHeadError("the pull request head moved to ccccccc after commit aaaaaaa was reviewed", "c".repeat(40));
+    };
+    gh.dismissStaleChangeRequests = async () => {
+      gh.calls.push({ method: "dismissStaleChangeRequests", args: [] });
+      return { dismissed: [], failed: [] };
+    };
+    const r = await run(s, ["--agent-outcome", "success", "--plan-out", s.planOut], { gh });
+    expect(r.code).toBe(0);
+    for (const m of ["dismissStaleChangeRequests", "updateIssueComment", "createIssueComment", "addLabels", "removeLabel"]) expect(callsOf(gh, m), m).toHaveLength(0);
+    expect(r.fetch.calls).toHaveLength(0);
+    const rep = JSON.parse(readFileSync(s.planOut, "utf8")) as PublishReport;
+    expect(rep.stale).toEqual({ reason: "the pull request head moved to ccccccc after commit aaaaaaa was reviewed", head_sha: "c".repeat(40) });
+    expect(rep.errors).toEqual([]);
+    expect(r.outputs.fired_outcomes).toBe("completed");
   });
 });

@@ -45,15 +45,27 @@ spam, leave the sandbox).
   pushing to a bot's branch does not skip the review. (Earlier commits by other people are not
   checked: git commit authors can be forged.)
 - When GitHub refuses the APPROVE / REQUEST_CHANGES event (workflow token not allowed to approve,
-  own PR), the review is posted as a comment and is not counted as approving or blocking. An
-  APPROVE is only submitted while the reviewed commit is still the open PR's head (an unreadable
-  PR withholds it).
+  own PR), the review is posted as a comment and is not counted as approving or blocking. No
+  review is posted unless the reviewed commit is still the PR's head (read right before posting;
+  a moved head makes the run stale, and a PR that cannot be read then posts no review and fails the
+  publish job). An APPROVE also needs an open PR and is withheld
+  when `approve.never_paths` / `approve.max_changed_lines` fail on GitHub's own file list for the
+  PR (an unreadable or truncated list withholds it too), so a doctored artifact cannot approve
+  paths the policy protects.
+- The publisher takes the PR identity (repository, number, head sha) from the workflow
+  (`--repo`, `--pr-number`, `--head-sha`), never from the artifact the agent's job uploaded: an
+  artifact naming another PR or commit publishes nothing. The PR link in notifications and the
+  repository_dispatch payload is built from that identity, never from the artifact. With neither
+  `--head-sha` nor the artifact's context, the head is read from GitHub before anything is
+  published, so the stale-run checks still apply; an unreadable PR publishes nothing.
 - Approvals and change requests stay in force on GitHub until dismissed. The publisher dismisses
   its earlier approvals on every run that does not approve (skips, errors, usage limits,
   incomplete and request-changes runs included), and its change requests only from a run for the
   PR's current head and only those on older commits; a re-run of an older workflow run (or a run
   whose commit was superseded while it ran) is "stale" and posts only its check: it never
-  approves, dismisses, comments or labels. Only reviews by the publisher's identity that carry the
+  approves, dismisses, comments or labels. Review bodies and the sticky comment end with the
+  run's marker (`<!-- xrepo-review:run=<id> -->`), so an older run re-run later is stale too.
+  Only reviews by the publisher's identity that carry the
   hidden `<!-- xrepo-review:review -->` marker are ever dismissed, because the default identity
   (`github-actions[bot]`) is shared by every workflow using `GITHUB_TOKEN`; prefer a GitHub App
   token with `--self-login`.
@@ -80,21 +92,43 @@ spam, leave the sandbox).
 **T3 — Exfiltration of other repositories' code or secrets** through review comments.
 - Per-PR-repository read allowlist (`cross_repo.readable` / `deny`) enforced by xsearch:
   unreadable repositories do not exist for the agent, not even their names.
-- Path denylist (`.env`, keys, `secrets/`, tfstate, … plus `search.deny_globs`) behaves like
+- Path denylist (`.env`, keys and keystores (`*.jks`, `*.keystore`, `*.ppk`), credential files
+  (`.git-credentials`, `.aws/credentials`, `.docker/config.json`, `.kube/config`,
+  `*kubeconfig*.yaml` / `*kubeconfig*.yml` such as `prod-kubeconfig.yml`, `*.kubeconfig`; a plain
+  `kubeconfig` file or directory without an extension stays readable), `secrets/`, tfstate
+  and `terraform.tfvars` / `*.auto.tfvars`, … plus `search.deny_globs`) behaves like
   missing files, matched case-insensitively (`.ENV`, `KEY.PEM`; ripgrep gets them as `--iglob`,
   which also overrides any glob the agent passes); `.git` is never served; symlinks escaping a root
   are refused.
 - Secret redaction on every xsearch response; a private-key block is hidden from `BEGIN` to the
   next `-----END ` (within 64 KiB) whatever window Read or Grep shows, the same rule
   `redactSecrets` applies to whole texts (one implementation of the block rules, exported by
-  `src/common/redact.ts`). PrDiff redacts line by line: context and added lines inside a key block
+  `src/common/redact.ts`). Besides token formats and key blocks, assignments are redacted in three
+  forms: quoted values, env-file `KEY=value` lines whose UPPER_SNAKE key ends in a secret word, and
+  `aws_secret_access_key` lines. Unquoted YAML values (`password: value` without quotes) are not
+  redacted; the deny globs are the protection for config files. A `Bearer` token is redacted when
+  it has a digit, or when it is at least 32 characters and not an identifier-like name. PrDiff redacts line by line: context and added lines inside a key block
   of the PR's version of the file, key blocks within each hunk on both sides, and removed lines
   that look like key material in a hunk that touches a key (heuristic: xsearch has no base
   version of the file). ripgrep runs with `--encoding=none`, so a UTF-16 file is binary for Grep
   as for Read and cannot slip past the whole-file key scan. Agent globs never reach a backtracking
   regex (linear matcher, bounded brace expansion), and every search honours its deadline. xreview rejects comment text that looks like a secret; the
   publisher redacts again and neutralises images, non-allowlisted links (shown as inert text),
-  `@mentions`, HTML and link-reference tricks. Its sanitised output never ends inside an open code
+  `@mentions`, HTML and link-reference tricks (no kept construct contains a literal `@`: `@`
+  becomes `%40` in every kept link destination, a kept bare URL with `@` is written as
+  `<https://…%40…>` (GitHub does not link even that everywhere), and kept `<img>` alt text gets
+  U+200B after `@`, so a kept construct that GitHub shows as text (a math block, including one in
+  a list or blockquote, inline math, an escaping backslash, an HTML block) cannot ping; a
+  backslash right before any kept construct is also separated from it by U+200B, so it cannot
+  escape the `<`; every kept destination has `|`, `'` and `"` percent-encoded,
+  so a table cell boundary cannot split it and an HTML block cannot read it as a tag with an open
+  attribute value, and a truncation that cuts through a kept `<…>` drops it instead of leaving it
+  open; text glued in front of a kept URL's scheme, as in `@victim.https://…`, stays outside the
+  link, defanged and subject to mention neutralisation; an `@` right after `&` plus letters or
+  digits, as in `&amp@user`, is neutralised too, because GitHub decodes semicolon-less legacy
+  entities in HTML blocks; a top-level fence whose info string starts with `math`, or contains `&`
+  or `\`, is rewritten to a `text` fence, since GitHub renders math blocks as text with live
+  mentions and references). Its sanitised output never ends inside an open code
   fence or `<pre>` (checked with CommonMark's block rules), so text that follows, such as a
   suggestion block, cannot be swallowed or turned into raw HTML.
 - The execution log uploaded as an artifact is trimmed by `xrepo collect`: tool results, tool
@@ -123,7 +157,8 @@ spam, leave the sandbox).
   `--no-ext-diff --no-textconv` and gitattributes from the base commit (`--attr-source`) so a PR
   cannot hide changes behind `-diff`. On git older than 2.40 (no `--attr-source`) the diff runs in
   an isolated empty work tree and index, i.e. with no repository attributes at all, never the
-  PR's. The GitHub API diff fallback (no merge base in a shallow checkout) is refused when the PR
+  PR's. The GitHub API diff fallback (a shallow checkout where base is not a visible ancestor of head,
+  so the local merge base cannot be trusted) is refused when the PR
   changes a `.gitattributes` file and the API shows any file as binary; use `fetch_depth: 0`.
   That refusal, and an API diff GitHub will not serve for its size (HTTP 406), skip the review as
   author-controlled skips (a blocking check fails), never as an infrastructure error.
@@ -188,7 +223,7 @@ spam, leave the sandbox).
   policy comes from the trusted xrepo checkout at a pinned commit, never from the PR.
 - **Pin everything by SHA / digest**: the reusable workflow (`uses: …/review.yml@<sha>`),
   `anthropics/claude-code-action@<sha>` (pinned in `review.yml`), every `actions/*` step, the base
-  image (`NODE_IMAGE=node:22-bookworm-slim@sha256:…`) and the published xrepo image
+  images (`NODE_IMAGE=node:22-bookworm-slim@sha256:…`, `RUNTIME_IMAGE=ubuntu:24.04@sha256:…`) and the published xrepo image
   (`ghcr.io/<org>/xrepo-review@sha256:…`). `xrepo_ref` must be a reviewed commit SHA.
 - **Org ruleset** requiring the review workflow (or its check with a pinned expected source) on
   protected branches, and **CODEOWNERS** for `.github/workflows/` (and `.github/` in general)

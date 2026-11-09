@@ -92,7 +92,7 @@ Per review (job workspace, created by `prepare`):
 ```
 $WORK/agent/            # Claude Code cwd: only trusted generated files (no PR content)
 $WORK/agent/mcp.json    # MCP config for xsearch + xreview
-$WORK/ctx/pr.json       # PR context (repo, number, base/head sha, title, author, files[])
+$WORK/ctx/pr.json       # PR context (repo, number, base sha, full 40-hex head sha, title, author, files[])
 $WORK/ctx/diff.patch    # unified diff base...head (zero context lines not required; use -U3)
 $WORK/ctx/policy.resolved.json  # resolved policy for THIS repo (read by MCP servers, not by agent)
 $WORK/out/draft.jsonl   # the ONLY file xreview writes
@@ -231,7 +231,20 @@ the source of truth.
 ## Publisher rules (deterministic; `xrepo publish`)
 
 Input: the policy (resolved from the trusted manifest `--policy` whenever given; the artifact's
-`ctx/policy.resolved.json` only without it), PR context, draft.jsonl, GitHub token (env). Steps:
+`ctx/policy.resolved.json` only without it), PR context, draft.jsonl, GitHub token (env), and the
+PR identity from the workflow: `--repo <owner/name> --pr-number <n> [--head-sha <40-hex>]`
+(required when `GITHUB_ACTIONS=true`, exit 2 without them). The identity comes from these flags,
+never from `ctx/pr.json`, which passed through the agent's job: a pr.json naming another repo,
+number or head publishes nothing and exits 1. Without `--head-sha` (workflow_dispatch) pr.json's
+head is used only once GitHub confirms it is the PR head; otherwise nothing is published (exit 1),
+and a stale run whose head moved posts no check. With no pr.json either (the review job failed
+before uploading ctx) the head is read from GitHub (`pulls.get`) and drives the freshness checks
+(head and newer-run markers) and the check run; an unreadable PR publishes nothing (exit 1). The PR
+link (`pr_url` in templates and the repository_dispatch payload) is always
+`${GITHUB_SERVER_URL:-https://github.com}/<repo>/pull/<number>`, never pr.json's `html_url`; with
+the workflow's identity pr.json's `run_url` is ignored too: `{run_url}` in templates, notify and
+dispatch comes from `--run-url`, else `GITHUB_SERVER_URL`/`GITHUB_REPOSITORY`/`GITHUB_RUN_ID`, else
+is empty / null (title and author still come from pr.json). Steps:
 1. Parse draft lines with zod; drop invalid lines (audit). Enforce max sizes.
 2. Inline comments: path must be a changed file; line must fall inside a RIGHT-side diff hunk
    (computed from diff.patch); otherwise demote to the summary "Notes outside the diff" list.
@@ -239,7 +252,28 @@ Input: the policy (resolved from the trusted manifest `--policy` whenever given;
    (path,line,body hash); truncate body to `max_comment_chars`.
 3. Sanitize every outgoing text: redactSecrets; neutralize `@mentions` (`@` → `@​`) unless
    `output.allow_mentions`; remove markdown images; replace links whose host is not in
-   `output.link_allowlist` with plain text; strip HTML tags except the hidden marker.
+   `output.link_allowlist` with plain text; strip HTML tags except the hidden marker. An
+   allowlisted bare URL containing `@` is kept as an angle autolink with `@` percent-encoded
+   (`<https://github.com/%40user>`; a `www.` URL becomes `<http://www.…>`), because GitHub does
+   not link every bare URL (e.g. `www.` after a letter, or inside an HTML block); it links an
+   angle autolink in more places, but not everywhere (a math fence in a list or blockquote, or
+   inline math, shows it as text, where the `%40` keeps it from pinging). No kept
+   construct contains a literal `@`: it is `%40` in every kept link destination (absolute,
+   relative and fragment; inline links, definitions, autolinks, `<img src>`), and kept `<img>` alt
+   text gets U+200B after `@`, since GitHub shows a kept construct as text in several places (an
+   escaping backslash, an HTML block, math blocks including nested ones, `` $`…`$ `` inline math,
+   a link nested in a link) and the mention filter runs on that text. Kept destinations
+   also percent-encode `|`, `'` and `"`; bare URLs end at `|` (a GFM table splits cells before
+   inline parsing); kept `<img>` alt text has `|` replaced by a space; truncation (`safeCut`) drops
+   a kept `<…>` it would leave unclosed. Text in front of a URL's `http`/`https` scheme (`a.` in
+   `a.https://…`) is not part of the kept link: it stays outside the protected span, defanged
+   (`www.` → `www​.`) and visible to the mention filter, and an `@` directly in front of any kept
+   construct (link, autolink, allowed tag) also gets the invisible `@​`; so does an `@` right after
+   `&` plus letters or digits (`&amp@user`: GitHub decodes semicolon-less legacy entities in HTML
+   blocks). A backslash right before a kept construct is separated from it by U+200B, so it cannot
+   escape the `<`, `[` or `]`. A top-level fence whose info string starts with the word `math`, or
+   contains `&` or `\`, has its opener rewritten to `text` (GitHub renders math blocks as text with
+   live mentions and references, and decodes entities and escapes in the info string).
 4. Verdict resolution (downgrade to `comment` when a rule fails, recording why in the summary footer;
    rules in `src/review/rules.ts`, shared with xreview and prepare):
    - `approve` requires: capability enabled; no findings > `approve.max_severity_allowed`;
@@ -253,10 +287,19 @@ Input: the policy (resolved from the trusted manifest `--policy` whenever given;
    - When GitHub refuses the APPROVE / REQUEST_CHANGES event itself (Actions may not approve, own
      PR), the same review is posted as a COMMENT with a note; it then neither approves nor blocks
      (no `approved` / `blocked`), unless `block.method: both` still blocks via the failing check.
-     An APPROVE is also only submitted while the reviewed commit is still the open PR's head (the
-     PR is read first; unreadable → withheld): otherwise it is posted as a COMMENT ("approval
-     withheld") the same way.
-   - Every review body ends with the hidden marker `<!-- xrepo-review:review -->`. Only reviews by
+     Every review (any event) is posted only while the reviewed commit is still the PR head: the
+     PR is read right before posting, and a moved head posts nothing and makes the run stale; a PR
+     that cannot be read then posts no review of any event (a failed review post: infrastructure
+     failure, exit 1, re-run the publish job; sticky and check run as on any failed review post). An
+     APPROVE is also withheld (posted as a COMMENT, "approval withheld", the same way) when the PR
+     is not open, and when `approve.never_paths` / `approve.max_changed_lines`
+     fail on GitHub's own file list for the PR (`GET pulls/{n}/files`: names including previous
+     names, additions + deletions; an unreadable list, an entry without non-negative integer
+     additions / deletions, or a list at GitHub's 3000-file cap, withholds it).
+   - Every review body ends with the hidden marker `<!-- xrepo-review:review -->`. With
+     `GITHUB_RUN_ID` set, the body carries `<!-- xrepo-review:run=<id> -->` on the line before it
+     (at the very end of a body whose inline comments were folded in by the 422 fallback); a run
+     marker is read only at the end of a body. Only reviews by
      the publisher's own identity that carry it (or the exact framing of reviews posted before the
      marker existed) are ever dismissed: `github-actions[bot]` is shared by every workflow that uses
      GITHUB_TOKEN (a GitHub App token with `--self-login` is better).
@@ -269,11 +312,16 @@ Input: the policy (resolved from the trusted manifest `--policy` whenever given;
      our earlier approvals. Both best effort. With `approve.enabled`, also turn on branch
      protection's "Dismiss stale pull request approvals when new commits are pushed".
    - Stale runs: before publishing, the publisher asks GitHub whether this run still speaks for the
-     PR (`runFreshness`): its commit must be the PR head and no newer workflow run may have posted
-     the check for that commit. A stale run (a re-run of an older run, a push while it ran) posts
+     PR (`runFreshness`): its commit must be the PR head (compared as a full 40-hex sha, never as a
+     prefix), and no newer workflow run may have published: a check for that commit, or our sticky
+     comment / one of our reviews ending with a newer run's marker `<!-- xrepo-review:run=<id> -->`
+     (the run id only, so re-running just the publish job of the same run republishes). The head
+     is verified again right before the review is posted; a push in between makes the run stale
+     too. A stale run (a re-run of an older run, a push while it ran) posts
      only its check run and writes its outputs: no review, dismissal, sticky, labels,
      notifications, dispatch, retry marker or `approved` / `blocked`. Unknown (PR unreadable):
-     publish as usual.
+     publishing goes on, but the review is posted only once the head check right before posting
+     succeeds; a PR still unreadable then posts no review and exits 1.
 5. Blocking: `block.method` ∈ `review` (REQUEST_CHANGES review) | `check` (check-run with
    conclusion `failure`) | `both`. If `check` is configured, a check-run named `check.name` is
    always created with `success|neutral|failure` (neutral when inline comments are disabled).
@@ -288,7 +336,8 @@ Input: the policy (resolved from the trusted manifest `--policy` whenever given;
    (`summaryBudget` in `src/review/rules.ts`), within the sticky comment's room for the outcome
    comments and GitHub's review body cap. A run with nothing for the sticky (summary in the review
    or disabled, no outcome comment, e.g. a skip) replaces an earlier run's sticky with a short
-   status note (never creates one).
+   status note (never creates one). With `GITHUB_RUN_ID` set, the sticky comment (and that status
+   note) ends with `<!-- xrepo-review:run=<id> -->`, after any retry-after / retry-stop marker.
    Sanitized text never ends inside an open fence or `<pre>`, so whatever follows (a suggestion
    block, outcome comments) cannot be swallowed.
 7. Labels: only allowed ones.
@@ -302,10 +351,23 @@ Schema: `outcomes`, `OutcomeActions`, `DEFAULT_OUTCOMES`, `notifications` in `sr
 
 Module `src/outcome/` (no AI, runs in the publish job):
 - `classify.ts`: `classifyOutcome(input:{skipped?:{reason:string}, agentStepOutcome?: 'success'|'failure'|'cancelled'|'skipped'|string, executionFileText?: string, draft?: Draft}): {outcome: 'completed'|'incomplete'|'usage_limit'|'error'|'skipped', reason: string, reset_at?: string}`.
-  Order: skipped → usage_limit (execution file result/error text or any assistant/system message
-  matching usage-limit/rate-limit/429/quota/overloaded/credit-balance patterns; parse reset time:
-  `limit reached|<epoch>` → ISO, `resets <text>` → raw text) → completed (draft.finished) →
-  incomplete (draft has entries or result subtype `error_max_turns`) → error (reason from step outcome
+  Order: skipped → completed (draft.finished: finish() was called, whatever failed afterwards) →
+  usage_limit (structured evidence: result `api_error_status` 429/529, synthetic assistant
+  `error` / `api_error` such as rate_limit, overloaded, usage_limit_reached, rejected
+  `rate_limit_event`, `api_retry` 429/529 or rate_limit / overloaded; or the
+  result/error text or a trailing synthetic message in unambiguous CLI / API wording
+  (case-insensitive, `USAGE_LIMIT_PATTERNS`): "You've hit your" / "You've reached your" (straight
+  or curly apostrophe), "You're out of (extra) usage", "your org(anization) is out of usage", "your
+  seat type doesn't include", "your usage allocation has been disabled", "your group's usage
+  limit", "requires usage credits", "usage limit reached", "reached your specified API usage
+  limits", "session limit reached" / "weekly limit reached", "rate
+  limited" / "rate limit exceeded|reached|rejected" (not followed by `/`, `_` or `-`), "too many
+  requests", "API Error: 429", "API Error: 529", "API Error: Request rejected (429)", "529
+  Overloaded", the quoted JSON type `"overloaded_error"`, "credit balance is too low". A bare
+  "rate limit", "usage limit", "limit reached", "quota exceeded" or "<period> limit", any other
+  "<period> limit reached" (daily, monthly, Opus, ...), a 429/529 not right after
+  "API Error: ", or an overloaded / rate_limit token, as in a file path, is not evidence; parse reset time:
+  `limit reached|<epoch>` → ISO, `resets <text>` → raw text) → incomplete (draft has entries or result subtype `error_max_turns`) → error (reason from step outcome
   / result subtype / "no output"). Robust to execution_file being a JSON array, JSON lines, or absent.
 - `template.ts`: `renderTemplate(tpl, vars, escape: (s)=>string)`; unknown placeholders left
   literally; values escaped per channel (markdown → sanitizeMarkdown rules, slack → `&<>` escaped,
@@ -345,7 +407,8 @@ Module `src/outcome/` (no AI, runs in the publish job):
   run's `updated_at`.
 
 Publisher flow with outcomes (`xrepo publish`): extra flags `--agent-outcome`, `--execution-file`,
-`--skip-reason`, `--run-url`, `--run-attempt`, `--github-output`. Steps: classify → if completed or
+`--skip-reason`, `--run-url`, `--run-attempt`, `--github-output`, plus the PR identity flags
+`--repo`, `--pr-number`, `--head-sha` (see Publisher rules). Steps: classify → if completed or
 incomplete, build/execute the review plan (incomplete never approves/blocks) → derive extra outcomes
 `approved`/`blocked` from the executed plan → for each fired outcome (primary first, then
 approved/blocked): post `comment` (into the sticky comment; a completed review's summary stays primary
@@ -389,7 +452,7 @@ documented in README.
 
 ## prepare (`xrepo prepare`)
 
-Inputs (flags): `--policy`, `--repo owner/name`, `--pr N`, `--base-sha`, `--head-sha`,
+Inputs (flags): `--policy`, `--repo owner/name`, `--pr N`, `--base-sha`, `--head-sha` (full 40-hex),
 `--pr-checkout DIR`, `--mirror DIR`, `--work DIR`, `--event PATH` (GitHub event JSON for title,
 body, author, draft flag, fork flag), `--launcher docker|local`, `--image IMG`,
 `--policy-repo-path PATH` (the manifest's path inside its own, possibly mirrored, repository;
@@ -403,8 +466,13 @@ Outputs files under `--work` (see layout) and prints GitHub step outputs (`claud
   its size (HTTP 406) skips with "diff larger than the GitHub API serves (300 files or 20000
   lines)", and a refused `.gitattributes` API diff skips with "diff refused: …" (exit 0, pr.json
   written); both are author-controlled skips for the publisher.
-- Computes diff with `git -C <pr-checkout> diff --no-color -U3 <base>...<head>` (fetch depth
-  must allow it; falls back to `git diff base head`, then the GitHub API). Explicit options override
+- Computes diff with `git -C <pr-checkout> diff --no-color -U3 <base>...<head>`. In a shallow
+  checkout (`git rev-parse --is-shallow-repository` is not `false`) the local diff is used only when
+  `git merge-base --is-ancestor <base> <head>` succeeds, because git may compute a missing or wrong
+  merge base on truncated history. Otherwise it falls back to the GitHub API diff
+  (`application/vnd.github.v3.diff`; prepare fails without `GITHUB_TOKEN`/`GH_TOKEN`), never to
+  `git diff base head`, which shows every base commit since the fork point as reverted by the PR;
+  `diff_method` is `three-dot` | `api`. Explicit options override
   the runner's git config (`--inter-hunk-context=0`, `--diff-algorithm=myers`, `--indent-heuristic`,
   `-O/dev/null`, `--submodule=short`, `--ignore-submodules=none`, `-c diff.suppressBlankEmpty=false`,
   `-c core.bigFileThreshold=512m`), so the patch is the same on every runner. gitattributes never
@@ -441,7 +509,10 @@ desired set (policy edit, archived, renamed, made a fork, excluded) is retired a
 `current` is unlinked and `<repo>/.retired` (`{"retired_at": ISO}`) records when, so discovery stops
 listing it for every review that starts from then on — and its directory is deleted only after the
 same grace period (the report lists it under `retired`, then under `removed`); a retired repo that
-is listed again is restored from its snapshot. Concurrency-safe with a lock file whose holder
+is listed again is restored from its snapshot. Repository names are not case-sensitive in the
+mirror: a repo whose policy or API spelling changes only in case keeps its existing
+`<owner>/<repo>` directory under the original on-disk spelling (never retired for that reason);
+meta.json's `repo` carries the newest spelling. Concurrency-safe with a lock file whose holder
 refreshes it every 30 s; a lock not refreshed for 15 min (another host, or an unverifiable pid) is
 taken over; exit 3 means a sync elsewhere holds a fresh lock.
 

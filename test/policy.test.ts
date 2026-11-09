@@ -129,7 +129,20 @@ describe("compileGlobs", () => {
     for (const p of [".env", "app/.env.local", "certs/server.pem", "k.key", ".npmrc", "x/.netrc", "infra/prod.tfstate", "infra/prod.tfstate.backup", "home/.ssh/id_ed25519", "config/secrets/db.yml"]) {
       expect(deny(p), p).toBe(true);
     }
-    for (const p of ["src/env.ts", "README.md", "keys.ts", "src/secret.ts"]) expect(deny(p), p).toBe(false);
+    for (const p of [
+      ".git-credentials", "home/.aws/credentials", "android/release.jks", "app/debug.keystore", "putty/id.ppk",
+      "infra/terraform.tfvars", "infra/terraform.tfvars.json", "infra/prod.auto.tfvars", "infra/a.auto.tfvars.json",
+      "home/.docker/config.json", "home/.kube/config", "deploy/kubeconfig.yaml", "ci/prod.kubeconfig",
+      "deploy/prod-kubeconfig.yml", "kubeconfig_staging.yaml",
+    ]) {
+      expect(deny(p), p).toBe(true);
+    }
+    for (const p of [
+      "src/env.ts", "README.md", "keys.ts", "src/secret.ts", "pkg/kubeconfig/kubeconfig.go", "pkg/kubeconfig/values.yaml", "src/keystore.ts",
+      "docker/config.json", "aws/credentials.ts", "infra/variables.tf", "infra/example.tfvars",
+    ]) {
+      expect(deny(p), p).toBe(false);
+    }
     const excl = compileGlobs(DEFAULT_EXCLUDE_GLOBS);
     for (const p of ["node_modules/x/index.js", "a/vendor/b.go", "web/app.min.js", "package-lock.json", "svc/go.sum", "dist/a.js"]) {
       expect(excl(p), p).toBe(true);
