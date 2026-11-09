@@ -1,0 +1,38 @@
+{
+  "name": "xrepo-review",
+  "version": "0.1.0",
+  "description": "Policy-gated, cross-repo PR review for anthropics/claude-code-action: sandboxed code-search MCP, capability manifest, deterministic publisher.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "xrepo": "dist/cli.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "dev": "tsx src/cli.ts"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "schema"
+  ],
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@octokit/rest": "^22.0.1",
+    "picomatch": "^4.0.7",
+    "yaml": "^2.9.1",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.5",
+    "@types/picomatch": "^4.0.3",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
