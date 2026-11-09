@@ -1,0 +1,175 @@
+# xrepo-retry: re-runs reviews that were postponed (outcome usage_limit / error with
+# outcomes.<o>.retry.enabled) once the limit has reset (`xrepo retry`).
+#
+# Repositories swept: the policy's `repos:` keys and exact `mirror.repos` names, plus every
+# repository of the installation's account or of an owner named in `repos:` / `mirror.repos` that
+# has an open PR with a retry label enabled in `defaults` (found with the search API; repositories
+# the token cannot see are not swept). For every open PR there carrying a retry label it finds the
+# latest run of the caller workflow for the PR's head SHA and re-runs it while run_attempt <
+# max_attempts (the limit of the outcome that ended the run, from the publisher's retry-after /
+# retry-stop marker in the sticky comment); otherwise it removes the label and comments once.
+#
+# Token: a GitHub App installation token with actions:write (re-run) and pull-requests:write
+# (labels, comment), minted per run. Configure vars.XREPO_APP_CLIENT_ID and
+# secrets.XREPO_APP_PRIVATE_KEY (a different App from the sync one is recommended: least privilege).
+# An installation token covers ONE account, so the sweep runs once per owner: the `owners` job
+# lists the accounts the sweep covers (owners of policy.repos keys and mirror.repos entries, plus
+# this repository's owner; or exactly vars.XREPO_RETRY_OWNERS, a JSON array such as ["acme"], e.g.
+# to leave out owners whose repositories are only mirrored and where the App is not installed), and
+# one `retry` job per owner mints that owner's token and, when more than one owner is involved, runs
+# `xrepo retry --owner <owner>`. A single-owner policy runs exactly one unrestricted sweep, as before.
+# vars.XREPO_CALLER_WORKFLOW = file name of the caller workflow in each repository
+# (default xrepo-review.yml, as in examples/caller.yml).
+# vars.XREPO_PUBLISHER_LOGIN = the identity whose sticky comments carry the "retry-after" markers
+# (default github-actions[bot]: review.yml's publish job posts with github.token). Markers in
+# comments by anyone else are ignored.
+name: xrepo-retry
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Only print what would be done"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: xrepo-retry-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  owners:
+    runs-on: ${{ fromJSON(vars.XREPO_RETRY_RUNNER_LABELS || '["self-hosted","xrepo-review"]') }}
+    timeout-minutes: 10
+    outputs:
+      owners: ${{ steps.owners.outputs.owners }}
+      scoped: ${{ steps.owners.outputs.scoped }}
+    steps:
+      - name: Check out xrepo-review
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+
+      # owners = JSON array of the accounts to sweep (first spelling wins, case-insensitively);
+      # scoped = the policy and those accounts name more than one owner.
+      - name: Owners the sweep covers
+        id: owners
+        env:
+          POLICY: ${{ vars.XREPO_POLICY_PATH || '/etc/xrepo-review/policy.yaml' }}
+          REPO_OWNER: ${{ github.repository_owner }}
+          OWNERS_OVERRIDE: ${{ vars.XREPO_RETRY_OWNERS }}
+        run: |
+          set -euo pipefail
+          out="$(node --input-type=module - <<'JS'
+          import { resolve } from "node:path";
+          import { pathToFileURL } from "node:url";
+          const { loadPolicy } = await import(pathToFileURL(resolve("dist/policy/load.js")).href);
+          const policy = loadPolicy(process.env.POLICY);
+          const LOGIN = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+          const add = (map, owner) => {
+            if (!map.has(owner.toLowerCase())) map.set(owner.toLowerCase(), owner);
+          };
+          // The owners `xrepo retry` sweeps and searches: policy.repos keys and mirror.repos entries.
+          const named = new Map();
+          for (const r of [...Object.keys(policy.repos), ...policy.mirror.repos]) {
+            const parts = r.trim().split("/");
+            if (parts.length === 2 && LOGIN.test(parts[0])) add(named, parts[0]);
+          }
+          const legs = new Map();
+          const override = (process.env.OWNERS_OVERRIDE ?? "").trim();
+          if (override !== "") {
+            let list;
+            try {
+              list = JSON.parse(override);
+            } catch {
+              list = undefined;
+            }
+            if (!Array.isArray(list) || list.length === 0 || !list.every((o) => typeof o === "string" && LOGIN.test(o))) {
+              console.error('::error::vars.XREPO_RETRY_OWNERS must be a JSON array of GitHub account names, e.g. ["acme"]');
+              process.exit(1);
+            }
+            for (const o of list) add(legs, o);
+          } else {
+            for (const o of named.values()) add(legs, o);
+            add(legs, process.env.REPO_OWNER);
+          }
+          const all = new Map(named);
+          for (const o of legs.values()) add(all, o);
+          console.log(`owners=${JSON.stringify([...legs.values()])}`);
+          console.log(`scoped=${all.size > 1}`);
+          JS
+          )"
+          echo "$out"
+          echo "$out" >> "$GITHUB_OUTPUT"
+
+  retry:
+    needs: owners
+    name: retry (${{ matrix.owner }})
+    runs-on: ${{ fromJSON(vars.XREPO_RETRY_RUNNER_LABELS || '["self-hosted","xrepo-review"]') }}
+    timeout-minutes: 20
+    strategy:
+      # One owner at a time (the review runners stay free for reviews); one owner's failure (e.g.
+      # the App is not installed there) does not stop the others.
+      max-parallel: 1
+      fail-fast: false
+      matrix:
+        owner: ${{ fromJSON(needs.owners.outputs.owners) }}
+    steps:
+      - name: Check out xrepo-review
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+
+      - name: Mint a GitHub App token for this owner (actions:write, pull-requests:write)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.XREPO_APP_CLIENT_ID }}
+          private-key: ${{ secrets.XREPO_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          permission-actions: write
+          permission-pull-requests: write
+          permission-metadata: read
+
+      - name: Re-run postponed reviews
+        env:
+          XREPO_GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          POLICY: ${{ vars.XREPO_POLICY_PATH || '/etc/xrepo-review/policy.yaml' }}
+          WORKFLOW: ${{ vars.XREPO_CALLER_WORKFLOW || 'xrepo-review.yml' }}
+          PUBLISHER_LOGIN: ${{ vars.XREPO_PUBLISHER_LOGIN || 'github-actions[bot]' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+          OWNER: ${{ matrix.owner }}
+          SCOPED: ${{ needs.owners.outputs.scoped }}
+        run: |
+          set -euo pipefail
+          args=(retry --policy "$POLICY" --workflow "$WORKFLOW" --publisher-login "$PUBLISHER_LOGIN")
+          # Several owners: this job's token covers only $OWNER, so it sweeps only $OWNER's
+          # repositories; every other owner has its own job and token.
+          if [ "$SCOPED" = true ]; then args+=(--owner "$OWNER"); fi
+          if [ "$DRY_RUN" = true ]; then args+=(--dry-run); fi
+          node dist/cli.js "${args[@]}"

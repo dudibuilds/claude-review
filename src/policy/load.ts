@@ -6,12 +6,17 @@
  * - resolvePolicy: schema defaults <- `defaults` layer <- `repos[repo]` layer (objects merge
  *   recursively, arrays/scalars replace), except search.deny_globs / search.exclude_globs which
  *   accumulate on top of the built-in defaults. Outcomes merge over DEFAULT_OUTCOMES.
+ * - killSwitchReason: the `enabled: false` kill switch, checked by prepare, the retry sweeper and
+ *   the publisher on the policy each of them acts on.
+ * - policyWarnings / policyFileWarnings: valid but ineffective or surprising settings, printed by
+ *   `xrepo policy validate`.
+ * - readableRepos: the cross_repo allowlist; an unsupported deny pattern fails closed.
  */
 import { readFileSync, statSync } from "node:fs";
 import { parseDocument } from "yaml";
 import { z } from "zod";
 import { audit } from "../common/audit.js";
-import { repoPatternMatch } from "./glob.js";
+import { repoPatternCovers, repoPatternKind, repoPatternMatch, repoPatternProblem, repoPatternsOverlap } from "./glob.js";
 import {
   DEFAULT_DENY_GLOBS,
   DEFAULT_EXCLUDE_GLOBS,
@@ -320,14 +325,96 @@ export function resolvePolicy(file: PolicyFile, repo: string): ResolvedPolicy {
   return res.data;
 }
 
+/* ------------------------------ kill switch ------------------------------ */
+
+/** Skip reason for the `enabled: false` kill switch, shared by every stage so outputs agree. */
+export const KILL_SWITCH_REASON = "reviews are disabled for this repository (policy enabled: false)";
+
+/**
+ * The `enabled: false` kill switch: the skip reason when reviews are disabled for `policy.repo`,
+ * otherwise undefined. Fails closed: anything but `enabled: true` counts as disabled.
+ *
+ * Every stage must check it on the policy it actually acts on, not only prepare: the publisher
+ * re-resolves the live manifest at publish time (self-hosted mode), so a run that passed prepare
+ * while enabled must still be classified `skipped` (no review, approve/block, labels, notify or
+ * dispatch beyond the `skipped` outcome's own actions) once devops flips the switch.
+ */
+export function killSwitchReason(policy: Pick<ResolvedPolicy, "enabled">): string | undefined {
+  return policy.enabled === true ? undefined : KILL_SWITCH_REASON;
+}
+
+/* ------------------------------- warnings ------------------------------- */
+
+/**
+ * Valid but ineffective settings in a resolved policy (`xrepo policy validate` prints them).
+ * Findings only come from inline comments, so without them (inline_comments disabled or
+ * max_comments 0) block.enabled can never block, and approve has no severity gate.
+ */
+export function policyWarnings(policy: Pick<ResolvedPolicy, "capabilities">): string[] {
+  const c = policy.capabilities;
+  const inline = c.inline_comments.enabled && c.inline_comments.max_comments > 0;
+  const out: string[] = [];
+  if (!inline && c.block.enabled) {
+    out.push(
+      "capabilities.block.enabled has no effect: inline comments are disabled, and findings (checked against block.min_severity) only come from inline comments",
+    );
+  }
+  if (!inline && c.approve.enabled) {
+    out.push(
+      "capabilities.approve.enabled without inline comments: approve.max_severity_allowed is never checked, because findings only come from inline comments",
+    );
+  }
+  return out;
+}
+
+/**
+ * File-level warnings (`xrepo policy validate` prints them, each starting with its location):
+ * - mirror.repos entries that are neither owner/name nor owner/*: the schema accepts them so that
+ *   one bad entry does not stop every other repository from syncing, but `xrepo sync` fails them
+ *   on every run;
+ * - a repo layer's cross_repo.deny that drops a `defaults` deny entry (arrays replace, unlike
+ *   search.deny_globs) while that entry could still match a repository readable for that repo.
+ */
+export function policyFileWarnings(file: PolicyFile): string[] {
+  const out: string[] = [];
+  file.mirror.repos.forEach((entry, i) => {
+    const problem = repoPatternProblem(entry.trim(), { allowAll: false });
+    if (problem !== undefined) out.push(`mirror.repos[${i}]: ${problem}; xrepo sync fails this entry on every run`);
+  });
+  const inherited = file.defaults?.cross_repo?.deny ?? [];
+  if (inherited.length === 0) return out;
+  for (const [key, layer] of Object.entries(file.repos)) {
+    const own = layer.cross_repo?.deny;
+    if (own === undefined) continue;
+    const readable = [...(layer.cross_repo?.readable ?? file.defaults?.cross_repo?.readable ?? []), key];
+    for (const d of inherited) {
+      const pattern = d.trim();
+      if (repoPatternKind(pattern) === undefined) continue; // rejected by the schema
+      if (own.some((p) => repoPatternCovers(p.trim(), pattern))) continue;
+      if (!readable.some((p) => repoPatternsOverlap(p.trim(), pattern))) continue;
+      out.push(
+        `repos.${key}: cross_repo.deny replaces the defaults list, so ${JSON.stringify(pattern)} (denied in defaults) ` +
+          `is not denied for this repository; add it to repos.${key}.cross_repo.deny to keep it denied`,
+      );
+    }
+  }
+  return out;
+}
+
 /**
  * Mirror repos readable while reviewing `policy.repo`: those matching a cross_repo.readable pattern
  * and no cross_repo.deny pattern (deny wins). The PR repo's own default-branch mirror is readable
  * when present unless denied. "@pr" (the PR head checkout) is not a mirror repo and is handled by
  * the caller. Entries that are not owner/name are ignored. Sorted, de-duplicated.
+ *
+ * Fails closed: the schema only admits supported patterns (owner/name, owner/*, *), but should an
+ * unsupported deny pattern reach here (a hand-built policy), nothing is readable, since that
+ * pattern could never match the repositories it was meant to deny. An unsupported readable
+ * pattern matches nothing.
  */
 export function readableRepos(policy: ResolvedPolicy, mirrorRepos: string[]): string[] {
   const { readable, deny } = policy.cross_repo;
+  if (deny.some((p) => repoPatternKind(String(p).trim()) === undefined)) return [];
   const self = policy.repo.toLowerCase();
   const out = new Set<string>();
   for (const repo of mirrorRepos) {

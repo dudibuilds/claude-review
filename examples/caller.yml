@@ -1,0 +1,14 @@
+# .github/workflows/xrepo-review.yml — what each repository adds (self-hosted defaults).
+name: xrepo-review
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+permissions: {}
+jobs:
+  review:
+    # Keep contents: read. Policy `dispatch` actions use the XREPO_DISPATCH_TOKEN secret (contents:
+    # write on the target), also for this repository; never widen this grant for them.
+    permissions: { contents: read, pull-requests: write, issues: write, checks: write }
+    # Pin to a full commit SHA of the xrepo-review repository (never a branch).
+    uses: acme/xrepo-review/.github/workflows/review.yml@0123456789abcdef0123456789abcdef01234567 # v0.1.0
+    secrets: inherit

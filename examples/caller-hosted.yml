@@ -1,0 +1,44 @@
+# .github/workflows/xrepo-review.yml — hosted mode (GitHub-hosted runners).
+#
+# Two jobs, one per event type:
+#   review        pull requests: the reusable review workflow in hosted mode.
+#   mirror-cache  a daily scheduled run on the default branch: syncs the mirror and saves it in the
+#                 default-branch cache scope. GitHub scopes caches by ref, so a pull request run can
+#                 restore what its own earlier runs and the default branch saved, never another
+#                 pull request's; without this job the first run of every pull request clones every
+#                 mirrored repository. Keep its inputs identical to the review's (same cache key).
+name: xrepo-review
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+  schedule:
+    - cron: "37 4 * * *"
+  workflow_dispatch:
+permissions: {}
+jobs:
+  review:
+    if: github.event_name == 'pull_request'
+    # Keep contents: read. Policy `dispatch` actions use the XREPO_DISPATCH_TOKEN secret.
+    permissions: { contents: read, pull-requests: write, issues: write, checks: write }
+    # Pin to a full commit SHA of the xrepo-review repository (never a branch).
+    uses: acme/xrepo-review/.github/workflows/review.yml@0123456789abcdef0123456789abcdef01234567 # v0.1.0
+    with:
+      mode: hosted
+      runner_labels: '["ubuntu-latest"]'
+      xrepo_repo: acme/xrepo-review            # trusted source of CLI, image and policy
+      xrepo_ref: 0123456789abcdef0123456789abcdef01234567   # never the PR head in production
+      policy_file: .github/xrepo/policy.yaml   # inside that trusted checkout
+    secrets: inherit
+
+  mirror-cache:
+    if: github.event_name != 'pull_request'
+    permissions: { contents: read }
+    uses: acme/xrepo-review/.github/workflows/mirror-cache.yml@0123456789abcdef0123456789abcdef01234567 # v0.1.0
+    with:
+      runner_labels: '["ubuntu-latest"]'
+      xrepo_repo: acme/xrepo-review
+      xrepo_ref: 0123456789abcdef0123456789abcdef01234567
+      policy_file: .github/xrepo/policy.yaml
+    # Only the mirror token (contents: read on the mirrored repositories).
+    secrets:
+      XREPO_GITHUB_TOKEN: ${{ secrets.XREPO_GITHUB_TOKEN }}

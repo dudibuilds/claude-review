@@ -13,19 +13,38 @@
  *   - leak secrets (redactSecrets runs on everything, code included).
  *
  * Design (every pass is a linear scan or a linear regex; scans that could restart are capped):
- *   1. normalize: CR/CRLF -> LF, strip C0 controls, bidi overrides and our placeholder range.
+ *   1. normalize: CR/CRLF -> LF, strip C0 controls, bidi overrides, U+FEFF and our placeholder
+ *      range; lone surrogates become U+FFFD (the output is always well-formed UTF-16).
  *   2. redactSecrets.
  *   3. split into top-level fenced code blocks and prose. Fences are recognised conservatively
- *      (opener at column 0, never inside an HTML block); unclosed fences are closed at the end.
- *      Code is left alone apart from redaction (suggestions must stay byte-exact) and a
- *      disallowed ```suggestion info string is rewritten to `text`.
+ *      (opener at column 0, never where an HTML block may be open); closers follow CommonMark
+ *      exactly (0-3 spaces of indentation); unclosed fences are closed at the end. Code is left
+ *      alone apart from redaction (suggestions must stay byte-exact) and a disallowed ```suggestion
+ *      info string (or one whose block had a secret redacted) is rewritten to `text`.
  *   4. prose: drop HTML comments; neutralize entity references (U+200B after "&"); rewrite link
  *      reference definitions, inline links and images; handle every "<" (autolinks, allowed tags,
  *      other tags stripped, stray "<" neutralized); defang bare URLs; then safety nets that break
  *      any remaining "![", "](" and "]:" so that a construct this parser did not recognise cannot
  *      render; closing keywords; @mentions. Constructs that are kept (allowlisted links, allowed
  *      tags) are swapped for private-use placeholders so later passes cannot touch them.
- *   5. truncate (never inside a kept URL; an open fence is closed) and append a note.
+ *   5. settle the block structure of each sanitized prose segment (settleProse), so that the
+ *      renderer agrees with step 3 about where code is: a fence line that GitHub could read as a
+ *      top-level fence is broken (code that GitHub would otherwise end early or start late would
+ *      render as markdown/HTML without having been sanitized); an HTML block that may still be open
+ *      (judged on the OUTPUT, see HtmlBlocks) is ended before the next code block.
+ *   6. truncate (never inside a kept URL; an open fence is closed; a ```suggestion block is dropped,
+ *      never cut, because a cut suggestion deletes code when applied) and append a note.
+ *   7. balance the kept tags (balanceTags): an opener without a matching closer (or a closer GitHub
+ *      could ignore), a mis-nested opener and a stray closer are dropped, so no <details>, <pre>,
+ *      <sub>, <sup>, <code> or <summary> element the agent opened stays open after its text.
+ *
+ * Structural guarantee (relied on by the publisher, which appends trusted blocks such as the
+ * ```suggestion block, status footers, outcome comments and hidden markers after sanitized text):
+ * the output never ends inside a fenced code block or inside an HTML block of CommonMark types 1-5,
+ * and leaves no allowed HTML element open (so it cannot collapse, shrink or swallow what follows);
+ * a type 6/7 HTML *block* (e.g. after a "<details>...</details>" line) may still be open, and ends
+ * at the next blank line. So append further markdown after a blank line ("\n\n"), never directly
+ * on the next line.
  *
  * Neutralization uses U+200B (zero-width space): it is invisible, so text inside inline code spans
  * (which this module does not need to identify for safety) still looks unchanged, while the syntax
@@ -70,8 +89,14 @@ const PH_CLOSE = "\uE001";
 const PH_DIGIT0 = 0xe010;
 const PH_RE = /\uE000([\uE010-\uE019]+)\uE001/g;
 
-/** C0 controls (except TAB/LF), DEL, bidi embeddings/overrides/isolates, our placeholder range. */
-const STRIP_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069\uE000-\uE01F]/g;
+/**
+ * C0 controls (except TAB/LF), DEL, bidi embeddings/overrides/isolates, U+FEFF (a byte order mark
+ * that renderers skip at the start of a document would hide what follows it from this module's
+ * column-0 checks), our placeholder range.
+ */
+const STRIP_RE = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F\u202A-\u202E\u2066-\u2069\uFEFF\uE000-\uE01F]/g;
+/** A high surrogate not followed by a low one, or a low surrogate not preceded by a high one. */
+const LONE_SURROGATE_RE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g;
 /** Characters never allowed inside a URL we keep (whitespace, controls, invisible format chars). */
 const UNSAFE_URL_CHARS =
   /[\s\u0000-\u001F\u007F-\u009F\u00AD\u034F\u061C\u115F\u1160\u17B4\u17B5\u180B-\u180F\u200B-\u200F\u202A-\u202E\u2060-\u206F\u3164\uFE00-\uFE0F\uFEFF\uFFA0]/;
@@ -85,15 +110,35 @@ function isHighSurrogate(code: number): boolean {
 }
 
 /** s.slice(0, n) without splitting a surrogate pair. */
-function sliceSafe(s: string, n: number): string {
+export function sliceSafe(s: string, n: number): string {
   if (n <= 0) return "";
   if (n >= s.length) return s;
   return isHighSurrogate(s.charCodeAt(n - 1)) ? s.slice(0, n - 1) : s.slice(0, n);
 }
 
+/** Replace lone surrogates with U+FFFD (String.prototype.toWellFormed). */
+export function wellFormed(s: string): string {
+  return s.replace(LONE_SURROGATE_RE, "\uFFFD");
+}
+
+/**
+ * Untrusted text as one line of at most `maxChars` characters: line breaks, controls, bidi
+ * controls and U+FEFF become spaces, whitespace runs collapse, lone surrogates become U+FFFD, and a
+ * cut (marked with "...") never splits a surrogate pair. Not markdown-safe by itself: sanitize after.
+ */
+export function singleLine(text: string, maxChars: number): string {
+  const t = wellFormed(String(text ?? ""))
+    .replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069\u2028\u2029\uFEFF]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  const max = Math.max(1, Math.floor(maxChars));
+  if (t.length <= max) return t;
+  return `${sliceSafe(t, max - 1).trimEnd()}\u2026`;
+}
+
 function normalizeInput(text: unknown): string {
   const s = typeof text === "string" ? text : text === undefined || text === null ? "" : String(text);
-  return s.replace(/\r\n?/g, "\n").replace(STRIP_RE, "");
+  return wellFormed(s.replace(/\r\n?/g, "\n").replace(STRIP_RE, ""));
 }
 
 /** Break autolink triggers in a URL-ish string: "://" -> ":\u200B//", "www." -> "www\u200B.". */
@@ -132,7 +177,7 @@ export function safeCut(text: string, max: number): string {
  * backtick run inside, padded when needed. Inline code is inert on GitHub (no links, mentions, HTML).
  */
 export function inlineCode(text: string, maxChars = 300): string {
-  let s = String(text ?? "").replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069\u2028\u2029]+/g, " ");
+  let s = wellFormed(String(text ?? "")).replace(/[\u0000-\u001F\u007F\u202A-\u202E\u2066-\u2069\u2028\u2029\uFEFF]+/g, " ");
   if (s.length > maxChars) s = `${sliceSafe(s, Math.max(1, maxChars - 1))}\u2026`;
   if (s === "") s = " ";
   let longest = 0;
@@ -278,33 +323,112 @@ interface Segment {
   text: string;
   /** Code segments: the fence string that closes them (used when truncating inside). */
   fence?: string;
+  /** Code segments: a kept ```suggestion block (dropped, never cut, when truncating). */
+  suggestion?: boolean;
 }
 
 const FENCE_OPEN_RE = /^(`{3,}|~{3,})(.*)$/;
-const FENCE_CLOSE_RE = /^[ \t]*(`{3,}|~{3,})[ \t]*$/;
+/** CommonMark closing fence: 0-3 spaces of indentation (a tab is 4 columns), spaces/tabs after. */
+const FENCE_CLOSE_RE = /^ {0,3}(`{3,}|~{3,})[ \t]*$/;
 
 function isSuggestionInfo(info: string): boolean {
   return /^[ \t]*suggestion/i.test(info);
 }
 
+/* ----------------------------- block structure ----------------------------- */
+
 /**
- * End condition of an HTML block starting on this line (CommonMark types 1-7, over-approximated:
- * any line starting with "<letter" or "</" is treated as a block that ends at a blank line). Being
- * generous here only means fewer fences are recognised as code, which is the safe direction.
+ * CommonMark blank line: nothing but spaces and tabs. JS trim() would also accept U+00A0, U+3000,
+ * U+2000-U+200A ..., which GitHub treats as content (an HTML block does not end there).
  */
-function htmlBlockEnd(line: string): RegExp | "blank" | null {
+function isBlankLine(line: string): boolean {
+  return /^[ \t]*$/.test(line);
+}
+
+/** Column of the first character that is not a space or tab (tab stops every 4 columns). */
+function indentWidth(line: string): number {
+  let col = 0;
+  for (let i = 0; i < line.length; i++) {
+    const c = line.charCodeAt(i);
+    if (c === 32) col++;
+    else if (c === 9) col += 4 - (col % 4);
+    else break;
+  }
+  return col;
+}
+
+/** CommonMark HTML block kinds 1-5 (each ends at a line containing its marker); 6 = types 6 and 7. */
+type HtmlKind = 1 | 2 | 3 | 4 | 5 | 6;
+type MarkerKind = Exclude<HtmlKind, 6>;
+const HTML_END: Record<MarkerKind, RegExp> = {
+  1: /<\/(?:script|pre|style|textarea)>/i,
+  2: /-->/,
+  3: /\?>/,
+  4: />/,
+  5: /\]\]>/,
+};
+
+/**
+ * Kind of HTML block this line could start (CommonMark 4.6, over-approximated: any line starting
+ * with "<letter" or "</" counts as a type 6/7 start, whatever the context).
+ */
+function htmlBlockStart(line: string): HtmlKind | null {
   const m = /^ {0,3}</.exec(line);
   if (!m) return null;
   const rest = line.slice(m[0].length - 1);
-  if (/^<(?:script|pre|style|textarea)(?:[\s>]|$)/i.test(rest)) return /<\/(?:script|pre|style|textarea)>/i;
-  if (rest.startsWith("<!--")) return /-->/;
-  if (rest.startsWith("<?")) return /\?>/;
-  if (rest.startsWith("<![CDATA[")) return /\]\]>/;
-  if (/^<![A-Za-z]/.test(rest)) return />/;
-  if (/^<\/?[A-Za-z]/.test(rest)) return "blank";
+  if (/^<(?:script|pre|style|textarea)(?:[\s>]|$)/i.test(rest)) return 1;
+  if (rest.startsWith("<!--")) return 2;
+  if (rest.startsWith("<?")) return 3;
+  if (rest.startsWith("<![CDATA[")) return 5;
+  if (/^<![A-Za-z]/.test(rest)) return 4;
+  if (/^<\/?[A-Za-z]/.test(rest)) return 6;
   return null;
 }
 
+/**
+ * Sound over-approximation of "the renderer may be inside an HTML block" for top-level lines that
+ * are not inside a fenced code block. Every line that could start a block counts as a start (even
+ * where CommonMark would not start one: inside another block, a type-7 tag that cannot interrupt a
+ * paragraph), and each kind is tracked independently, so a block the renderer really has open is
+ * always reported open. Type 6/7 blocks end at a CommonMark blank line, types 1-5 at their marker.
+ */
+class HtmlBlocks {
+  private blank = false;
+  /** Kind (1-5) -> indexes of the lines that may have started it and not been ended since. */
+  private readonly starts = new Map<MarkerKind, number[]>();
+
+  get open(): boolean {
+    return this.blank || this.starts.size > 0;
+  }
+
+  /** A type 6/7 block may be open (it ends at the next blank line). */
+  get blankOpen(): boolean {
+    return this.blank;
+  }
+
+  feed(line: string, index: number): void {
+    if (this.blank && isBlankLine(line)) this.blank = false;
+    for (const k of [...this.starts.keys()]) if (HTML_END[k].test(line)) this.starts.delete(k);
+    const k = htmlBlockStart(line);
+    if (k === 6) this.blank = true;
+    else if (k !== null && !HTML_END[k].test(line)) {
+      const list = this.starts.get(k);
+      if (list) list.push(index);
+      else this.starts.set(k, [index]);
+    }
+  }
+
+  /** Lines that started a block of kind 1-5 that may still be open. */
+  openStarts(): number[] {
+    return [...this.starts.values()].flat();
+  }
+}
+
+/**
+ * Split into prose and top-level fenced code. A column-0 fence opens code only where no HTML block
+ * can be open (the INPUT is judged here, so fences inside HTML blocks are sanitized as prose);
+ * settleProse later makes sure the renderer also sees an opener there, judging the OUTPUT.
+ */
 function segment(s: string, allowSuggestions: boolean): Segment[] {
   const lines = s.split("\n");
   const segs: Segment[] = [];
@@ -313,15 +437,10 @@ function segment(s: string, allowSuggestions: boolean): Segment[] {
     if (prose.length > 0) segs.push({ code: false, text: prose.join("\n") });
     prose = [];
   };
-  let html: RegExp | "blank" | null = null;
+  let html = new HtmlBlocks();
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i] ?? "";
-    if (html !== null) {
-      prose.push(line);
-      if (html === "blank" ? line.trim() === "" : html.test(line)) html = null;
-      continue;
-    }
-    const fm = FENCE_OPEN_RE.exec(line);
+    const fm = html.open ? null : FENCE_OPEN_RE.exec(line);
     const open = fm?.[1] ?? "";
     const info = fm?.[2] ?? "";
     if (fm && !(open.startsWith("`") && info.includes("`"))) {
@@ -333,22 +452,106 @@ function segment(s: string, allowSuggestions: boolean): Segment[] {
       }
       flush();
       const closed = j < lines.length;
-      const opener = !allowSuggestions && isSuggestionInfo(info) ? `${open}text` : line;
       const body = lines.slice(i + 1, closed ? j : lines.length);
-      segs.push({ code: true, text: [opener, ...body, closed ? (lines[j] ?? open) : open].join("\n"), fence: open });
+      // A redacted secret inside a committable suggestion would be committed as "[REDACTED:...]".
+      const suggestion = isSuggestionInfo(info) && allowSuggestions && !body.some((l) => l.includes("[REDACTED:"));
+      const opener = isSuggestionInfo(info) && !suggestion ? `${open}text` : line;
+      segs.push({
+        code: true,
+        text: [opener, ...body, closed ? (lines[j] ?? open) : open].join("\n"),
+        fence: open,
+        ...(suggestion ? { suggestion: true } : {}),
+      });
       i = closed ? j : lines.length;
+      html = new HtmlBlocks();
       continue;
     }
-    const hb = htmlBlockEnd(line);
-    if (hb !== null) {
-      prose.push(line);
-      if (hb === "blank" || !hb.test(line)) html = hb; // types 1-5 can end on their start line
-      continue;
-    }
+    html.feed(line, i);
     prose.push(line);
   }
   flush();
   return segs;
+}
+
+/** A potential fence line: indentation, a run of 3+ backticks or tildes, the rest. */
+const FENCE_LINE_RE = /^([ \t]*)(`{3,}|~{3,})(.*)$/;
+/** A list item that starts at column 0 with content on its first line; the match length is its content column. */
+const LIST_ITEM_RE = /^(?:([-+*])|(\d{1,9})[.)])( {1,4})(?=[^ \t])/;
+const THEMATIC_BREAK_RE = /^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$/;
+
+/** "```" -> "``\u200B`": no run of 3 left, so it is no fence anywhere; looks the same. */
+function breakFenceRun(run: string): string {
+  return (run.match(/[`~]{1,2}/g) ?? []).join(ZWSP);
+}
+
+/** Drop the "<pre>" (or neutralize the "<") that starts an HTML block which is never ended. */
+function dropHtmlStart(line: string): string {
+  return line.replace(/^( {0,3})<(?:pre>)?/i, (_m, sp: string) => `${sp}${ZWSP}`);
+}
+
+/** End every HTML block of kind 1-5 that may be open at the end of `text` (never lengthens it). */
+function endHtmlBlocks(text: string): string {
+  if (!text.includes("<")) return text;
+  const lines = text.split("\n");
+  const html = new HtmlBlocks();
+  lines.forEach((l, i) => html.feed(l, i));
+  const starts = html.openStarts();
+  if (starts.length === 0) return text;
+  for (const i of starts) lines[i] = dropHtmlStart(lines[i] ?? "");
+  return lines.join("\n");
+}
+
+/**
+ * Settle the block structure of one sanitized prose segment, judged on the text GitHub will see.
+ *
+ * 1. Fences. step 3 only treats column-0 fences outside HTML blocks as code; GitHub also opens a
+ *    fence at 1-3 spaces of indentation and inside what this module merely suspects to be an HTML
+ *    block. Such a fence in prose would make GitHub close it at the next code block's opener (or
+ *    keep it open past that block's closer), so code that was never sanitized would render as
+ *    markdown and HTML. Every fence line that could be a top-level fence is therefore broken
+ *    (breakFenceRun). Fences that are certainly inside a list item (indented to the content column
+ *    of an item that started at column 0 where no HTML block or table could be open, with every
+ *    line since blank or indented that far) stay, so code blocks in lists keep rendering.
+ * 2. HTML blocks, tracked on the output (sanitizing can change what starts or ends one, e.g. a
+ *    "[<details>]: url" definition becomes "<details> (host)", a "`</pre>`" code span loses its
+ *    "</pre>"): a "<pre>" whose block may still be open is dropped, and when code follows, a blank
+ *    line ends a type 6/7 block that may be open.
+ *
+ * `afterCode`: the segment follows a fenced code block (GitHub is then not inside a paragraph).
+ */
+function settleProse(text: string, afterCode: boolean, beforeCode: boolean): string {
+  const lines = text.split("\n");
+  const html = new HtmlBlocks();
+  let item = 0; // content column of a list item every line since stayed inside (0 = none)
+  let tableish = false; // a line with "|" since the last blank line: a GFM table may be open
+  let prevBlank = afterCode;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i] ?? "";
+    const blank = isBlankLine(line);
+    const indent = blank ? 0 : indentWidth(line);
+    const inItem = item > 0 && indent >= item;
+    if (!blank && !inItem) {
+      item = 0;
+      const m = LIST_ITEM_RE.exec(line);
+      // An ordered item can interrupt a paragraph only when it starts with 1.
+      if (m && !html.open && !tableish && !THEMATIC_BREAK_RE.test(line) && (m[1] !== undefined || m[2] === "1" || prevBlank)) {
+        item = m[0].length;
+      }
+    }
+    const fm = !blank && indent <= 3 && !inItem ? FENCE_LINE_RE.exec(line) : null;
+    if (fm) {
+      const run = fm[2] ?? "";
+      const rest = fm[3] ?? "";
+      if (run.startsWith("~") || !rest.includes("`")) lines[i] = `${fm[1] ?? ""}${breakFenceRun(run)}${rest}`;
+    }
+    html.feed(lines[i] ?? "", i);
+    if (blank) tableish = false;
+    else if (line.includes("|")) tableish = true;
+    prevBlank = blank;
+  }
+  for (const i of html.openStarts()) lines[i] = dropHtmlStart(lines[i] ?? "");
+  const out = lines.join("\n");
+  return beforeCode && html.blankOpen ? `${out}\n` : out;
 }
 
 /* ---------------------------- inline code spans ---------------------------- */
@@ -489,7 +692,7 @@ function rewriteDefinitions(s: string, ctx: Ctx): string {
         continue;
       }
     }
-    canStart = line.trim() === "";
+    canStart = isBlankLine(line);
   }
   return lines.join("\n");
 }
@@ -907,8 +1110,14 @@ function neutralizeClosingRefs(s: string): string {
     .replace(CLOSE_URL_RE, (kw: string) => `${kw}${ZWSP}`);
 }
 
-/** @user / @org/team (GitHub needs a non-word char or start before "@"; emails are left alone). */
-const MENTION_RE = /(?<![A-Za-z0-9_])@(?=[A-Za-z0-9])/g;
+/**
+ * @user / @org/team. GitHub's mention filter runs on the rendered text nodes and needs a non-word
+ * character or the start of a node before "@". Only an ASCII letter or digit right before "@" is
+ * left alone (e-mail addresses): an "_" is NOT, because "_@user_" / "__@org/team__" render as
+ * <em>@user</em> / <strong>@org/team</strong>, whose text node starts with "@" (the underscores are
+ * emphasis delimiters, consumed by the renderer).
+ */
+const MENTION_RE = /(?<![A-Za-z0-9])@(?=[A-Za-z0-9])/g;
 
 function sanitizeProse(s: string, ctx: Ctx): string {
   let t = dropHtmlComments(s);
@@ -925,30 +1134,145 @@ function sanitizeProse(s: string, ctx: Ctx): string {
 
 /* ---------------------------------- public --------------------------------- */
 
-function assemble(parts: Segment[], max: number, forceNote: boolean): { text: string; truncated: boolean } {
-  const full = parts.map((p) => p.text).join("\n");
-  if (full.length <= max && !forceNote) return { text: full, truncated: false };
-  if (max < TRUNCATION_NOTE.length + 16) return { text: safeCut(full, max), truncated: true };
-  const budget = max - TRUNCATION_NOTE.length;
-  let out = "";
+/**
+ * The first `room` characters of a code segment, closed with its fence; preferably whole lines.
+ * "" when not even the opener line fits.
+ */
+function cutCode(p: Segment, room: number): string {
+  const closing = `\n${p.fence ?? "```"}`;
+  const avail = room - closing.length;
+  const openerEnd = p.text.indexOf("\n");
+  if (openerEnd === -1 || avail <= openerEnd) return "";
+  const head = sliceSafe(p.text, avail);
+  const nl = head.lastIndexOf("\n");
+  return (nl > openerEnd ? head.slice(0, nl) : safeCut(p.text, avail)) + closing;
+}
+
+/** The kept parts (joined with "\n" by the caller) and the truncation note to append. */
+interface Assembled {
+  pieces: Segment[];
+  note: string;
+  truncated: boolean;
+}
+
+function assemble(parts: Segment[], max: number, forceNote: boolean): Assembled {
+  const full = parts.reduce((n, p, i) => n + p.text.length + (i === 0 ? 0 : 1), 0);
+  if (full <= max && !forceNote) return { pieces: parts, note: "", truncated: false };
+  const note = max >= TRUNCATION_NOTE.length + 16 ? TRUNCATION_NOTE : "";
+  const budget = max - note.length;
+  const out: Segment[] = [];
+  let used = 0;
   for (const [idx, p] of parts.entries()) {
-    const piece = (idx === 0 ? "" : "\n") + p.text;
-    if (out.length + piece.length <= budget) {
-      out += piece;
+    const sep = idx === 0 ? 0 : 1;
+    if (used + sep + p.text.length <= budget) {
+      out.push(p);
+      used += sep + p.text.length;
       continue;
     }
+    const room = budget - used - sep;
+    let piece = "";
     if (p.code) {
-      const closing = `\n${p.fence ?? "```"}`;
-      const room = budget - out.length - closing.length;
-      const openerLen = piece.indexOf("\n", idx === 0 ? 0 : 1);
-      if (openerLen !== -1 && room > openerLen) out += safeCut(piece, room) + closing;
-    } else {
-      const room = budget - out.length;
-      if (room > 0) out += safeCut(piece, room);
+      // A cut ```suggestion would still be committable and delete the code after the cut.
+      if (!p.suggestion) piece = cutCode(p, room);
+    } else if (room > 0) {
+      // Cutting can separate a "<pre>" from its "</pre>": end what may be left open.
+      piece = endHtmlBlocks(safeCut(p.text, room));
     }
+    if (piece !== "") out.push({ ...p, text: piece });
     break;
   }
-  return { text: out + TRUNCATION_NOTE, truncated: true };
+  return { pieces: out, note, truncated: true };
+}
+
+/* ------------------------------ tag balancing ------------------------------ */
+
+/** Kept tags that must be closed by the same sanitized text (br is void). */
+const KEPT_TAG_RE = /<(\/?)(details|summary|code|pre|sub|sup)>/g;
+/**
+ * Elements whose closing tag only counts on the opener's own line. These are phrasing elements
+ * (and the one-line <summary>): once a block boundary lies between opener and closer, an HTML
+ * parser may ignore the closer (e.g. "</sub>" while a <p> is the current node), leaving the element
+ * open over everything that follows.
+ */
+const SAME_LINE_TAGS = new Set(["summary", "code", "sub", "sup"]);
+
+interface TagRef {
+  piece: number;
+  start: number;
+  end: number;
+  name: string;
+  line: number;
+}
+
+/**
+ * Balance the kept allowed tags of one sanitized output (prose pieces only; fenced code is text).
+ * An HTML element the agent opens and never closes wraps everything the publisher appends after
+ * the sanitized text (status footer, trusted footer, outcome comments): an unclosed <details>
+ * collapses it under a label the agent chose, <sub>/<sup> shrink it. Matching is a stack of the
+ * openers, judged on the OUTPUT (tags inside rendered code spans are text):
+ *   - a closer matches the nearest open element of its name; openers above it are mis-nested;
+ *   - <summary> <code> <sub> <sup> must close on the opener's line; a </details> or </pre> on a line
+ *     that may belong to a GFM table does not count (a table cell is a scope boundary: GitHub's
+ *     HTML parser ignores the closer there);
+ *   - every opener without a matching closer, every mis-nested opener and every stray closer is
+ *     replaced by U+200B. That never lengthens the text, and it only removes HTML block starts, so
+ *     the fence and HTML-block decisions made earlier (settleProse) stay sound.
+ */
+function balanceTags(pieces: Segment[]): Segment[] {
+  const drops: TagRef[] = [];
+  const stack: TagRef[] = [];
+  let line = 0;
+  pieces.forEach((p, pi) => {
+    if (p.code || !p.text.includes("<")) {
+      line += p.text.split("\n").length;
+      return;
+    }
+    const inCode = makeInCode(codeSpanRanges(p.text));
+    let tableish = false; // a line with "|" since the last blank line: a GFM table may be open
+    let offset = 0;
+    for (const text of p.text.split("\n")) {
+      if (isBlankLine(text)) tableish = false;
+      else if (text.includes("|")) tableish = true;
+      KEPT_TAG_RE.lastIndex = 0;
+      for (let m = KEPT_TAG_RE.exec(text); m !== null; m = KEPT_TAG_RE.exec(text)) {
+        const start = offset + m.index;
+        if (inCode(start)) continue;
+        const ref: TagRef = { piece: pi, start, end: start + m[0].length, name: m[2] ?? "", line };
+        if (m[1] === "") {
+          stack.push(ref);
+          continue;
+        }
+        let k = stack.length - 1;
+        while (k >= 0 && stack[k]?.name !== ref.name) k--;
+        const opener = stack[k];
+        const counts = opener !== undefined && (SAME_LINE_TAGS.has(ref.name) ? opener.line === ref.line : !tableish);
+        if (!counts) {
+          drops.push(ref);
+          continue;
+        }
+        drops.push(...stack.splice(k + 1));
+        stack.length = k;
+      }
+      offset += text.length + 1;
+      line++;
+    }
+  });
+  drops.push(...stack);
+  if (drops.length === 0) return pieces;
+  const byPiece = new Map<number, TagRef[]>();
+  for (const d of drops) {
+    const list = byPiece.get(d.piece);
+    if (list) list.push(d);
+    else byPiece.set(d.piece, [d]);
+  }
+  return pieces.map((p, i) => {
+    const list = byPiece.get(i);
+    if (!list) return p;
+    // One pass per piece (many drops must not cost a full copy each); then end any HTML block of
+    // kind 1-5 a dropped closer may have left open (it never is: belt and braces).
+    const text = applyEdits(p.text, list.map((d) => ({ start: d.start, end: d.end, text: ZWSP })));
+    return { ...p, text: endHtmlBlocks(text) };
+  });
 }
 
 export function sanitizeMarkdownEx(text: string, opts: SanitizeOptions): SanitizeResult {
@@ -968,11 +1292,13 @@ export function sanitizeMarkdownEx(text: string, opts: SanitizeOptions): Sanitiz
     allowSuggestions: opts.allowSuggestions === true,
     ph: new Placeholders(),
   };
-  const parts = segment(red.text, ctx.allowSuggestions).map((seg) =>
-    seg.code ? seg : { code: false, text: sanitizeProse(seg.text, ctx) },
+  const segs = segment(red.text, ctx.allowSuggestions);
+  const parts = segs.map((seg, k) =>
+    seg.code ? seg : { code: false, text: settleProse(sanitizeProse(seg.text, ctx), k > 0, k + 1 < segs.length) },
   );
-  const { text: out, truncated } = assemble(parts, max, preCut);
-  return { text: out, truncated, redactions: red.count };
+  const assembled = assemble(parts, max, preCut);
+  const out = balanceTags(assembled.pieces).map((p) => p.text).join("\n") + assembled.note;
+  return { text: out, truncated: assembled.truncated, redactions: red.count };
 }
 
 /**

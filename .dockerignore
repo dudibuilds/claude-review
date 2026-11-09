@@ -1,0 +1,6 @@
+# Only package.json, package-lock.json, tsconfig.json and src/ are needed (docker/Dockerfile).
+**
+!package.json
+!package-lock.json
+!tsconfig.json
+!src/**

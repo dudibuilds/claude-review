@@ -10,7 +10,6 @@ export const CTX_FILES = {
   pr: "pr.json",
   diff: "diff.patch",
   policy: "policy.resolved.json",
-  prTags: "tags.pr.jsonl",
 } as const;
 
 export const PrFile = z.object({

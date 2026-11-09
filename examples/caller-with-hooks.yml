@@ -1,0 +1,74 @@
+# .github/workflows/xrepo-review.yml — caller plus follow-up jobs chained on the review outputs.
+#
+# Outputs of the review job (needs.review.outputs.*):
+#   outcome         completed | incomplete | usage_limit | error | skipped
+#   verdict         comment | approve | request_changes   (the published verdict)
+#   fired_outcomes  every outcome that fired, primary first, e.g. completed,blocked: `blocked` /
+#                   `approved` only when the publisher really blocked / approved (use these, not
+#                   verdict, to react to a block or an approval)
+#   reason, reset_at, findings, top_severity, skip_reason
+# The policy can already notify Slack / webhooks and send repository_dispatch per outcome (the
+# latter with the XREPO_DISPATCH_TOKEN secret: the review's write token stays contents: read); use
+# follow-up jobs for anything team-specific. Follow-up jobs run with THIS repository's secrets and
+# permissions, never with the reviewer's.
+name: xrepo-review
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+permissions: {}
+
+jobs:
+  review:
+    permissions: { contents: read, pull-requests: write, issues: write, checks: write }
+    uses: acme/xrepo-review/.github/workflows/review.yml@0123456789abcdef0123456789abcdef01234567 # v0.1.0
+    secrets: inherit
+
+  # Ping the team channel when the review was postponed by a Claude usage limit.
+  usage-limit-alert:
+    needs: review
+    if: ${{ !cancelled() && needs.review.outputs.outcome == 'usage_limit' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Post to Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.TEAM_SLACK_WEBHOOK_URL }}
+          RESET_AT: ${{ needs.review.outputs.reset_at }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          text="Review of ${PR_URL} postponed: Claude usage limit reached${RESET_AT:+ (resets ${RESET_AT})}."
+          # jq builds the JSON so no value can break out of the string.
+          jq -n --arg text "$text" '{text: $text}' |
+            curl -fsS -X POST -H 'Content-Type: application/json' --data @- "$SLACK_WEBHOOK_URL"
+
+  # Your own gate when the reviewer blocked the PR (e.g. request a security review).
+  on-blocked:
+    needs: review
+    if: ${{ !cancelled() && contains(needs.review.outputs.fired_outcomes, 'blocked') }}
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Request the security team's review
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR: ${{ github.event.pull_request.number }}
+          TOP: ${{ needs.review.outputs.top_severity }}
+        run: |
+          set -euo pipefail
+          echo "Blocked with top severity $TOP"
+          gh api -X POST "repos/$GITHUB_REPOSITORY/pulls/$PR/requested_reviewers" -f 'team_reviewers[]=security'
+
+  # Track reviews that could not run at all.
+  on-error:
+    needs: review
+    if: ${{ !cancelled() && needs.review.outputs.outcome == 'error' }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Record the failure
+        env:
+          REASON: ${{ needs.review.outputs.reason }}
+        run: |
+          echo "::warning::xrepo-review could not run: $REASON"

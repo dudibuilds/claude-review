@@ -1,0 +1,75 @@
+# End-to-end test on GitHub-hosted runners (README "Testing on GitHub").
+#
+# Open a PR that changes e2e/fixtures/acme/web so it calls createOrder with the old signature;
+# this workflow reviews it with the real claude-code-action in hosted mode (xrepo built from the PR
+# head, policy e2e/policy.yaml, mirror synced from bare repos generated out of e2e/fixtures) and
+# asserts that the review completed with at least one finding.
+#
+# Needs a CLAUDE_CODE_OAUTH_TOKEN (or ANTHROPIC_API_KEY) repository secret. Secrets are not passed
+# to workflows triggered from forks, so open the e2e PR from a branch of this repository.
+#
+# NOTE: xrepo_ref = the PR head is fine for testing xrepo-review itself; production callers must
+# pin xrepo_ref to a reviewed commit SHA (the policy is read from that checkout).
+name: e2e
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "e2e/**"
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Number of an open e2e pull request to (re-)review"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  review:
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: write
+    uses: ./.github/workflows/review.yml
+    with:
+      mode: hosted
+      runner_labels: '["ubuntu-latest"]'
+      launcher: docker
+      image: xrepo-review:e2e
+      xrepo_repo: ${{ github.repository }}
+      xrepo_ref: ${{ github.event.pull_request.head.sha || github.sha }}
+      policy_file: e2e/policy.yaml
+      mirror_url_template: "file://{workspace}/.xrepo-src/e2e/fixtures-bare/{owner}/{repo}.git"
+      pr_number: ${{ inputs.pr_number || '' }}
+    secrets: inherit
+
+  assert:
+    needs: review
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: The review found the broken consumer
+        env:
+          OUTCOME: ${{ needs.review.outputs.outcome }}
+          FINDINGS: ${{ needs.review.outputs.findings }}
+          VERDICT: ${{ needs.review.outputs.verdict }}
+          TOP: ${{ needs.review.outputs.top_severity }}
+          REASON: ${{ needs.review.outputs.reason }}
+          SKIP_REASON: ${{ needs.review.outputs.skip_reason }}
+        run: |
+          set -euo pipefail
+          echo "outcome=$OUTCOME findings=$FINDINGS verdict=$VERDICT top_severity=$TOP"
+          echo "reason=$REASON skip_reason=$SKIP_REASON"
+          if [ "$OUTCOME" != completed ]; then
+            echo "::error::expected outcome 'completed', got '$OUTCOME' (${REASON:-$SKIP_REASON})"
+            exit 1
+          fi
+          if ! [[ "$FINDINGS" =~ ^[0-9]+$ ]] || [ "$FINDINGS" -lt 1 ]; then
+            echo "::error::expected at least one finding, got '$FINDINGS'"
+            exit 1
+          fi
+          echo "e2e passed: $FINDINGS finding(s), top severity $TOP, verdict $VERDICT"

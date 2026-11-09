@@ -5,6 +5,7 @@
  * safe default: an empty manifest yields a comment-only reviewer that cannot approve or block.
  */
 import { z } from "zod";
+import { repoPatternProblem } from "./glob.js";
 
 export const SEVERITIES = ["info", "low", "medium", "high", "critical"] as const;
 export const Severity = z.enum(SEVERITIES);
@@ -19,6 +20,17 @@ const RepoName = z
   .regex(/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/, "expected owner/name");
 
 const Glob = z.string().min(1).max(512);
+
+/**
+ * Repository pattern (cross_repo.readable / deny, mirror.exclude): exact "owner/name", "owner/*" or
+ * "*" (policy/glob.ts repoPatternKind; surrounding whitespace is ignored, as when matching). Any
+ * other form, e.g. "acme/legacy-*", is rejected: it could never match, which would silently fail
+ * open in a deny list.
+ */
+export const RepoPattern = z.string().superRefine((p, ctx) => {
+  const problem = repoPatternProblem(p.trim());
+  if (problem !== undefined) ctx.addIssue({ code: z.ZodIssueCode.custom, message: problem });
+});
 
 export const DEFAULT_DENY_GLOBS = [
   "**/.env",
@@ -149,12 +161,15 @@ export type SearchPolicy = z.infer<typeof SearchPolicy>;
 export const CrossRepoPolicy = z
   .object({
     /**
-     * Mirror repos readable while reviewing a PR of this repo. Supports "owner/*" and "*".
-     * The PR head checkout ("@pr") is always readable.
+     * Mirror repos readable while reviewing a PR of this repo: "owner/name", "owner/*" or "*"
+     * (RepoPattern; other forms are rejected). The PR head checkout ("@pr") is always readable.
      */
-    readable: z.array(z.string().min(1)).default([]),
-    /** Explicitly unreadable, wins over `readable`. */
-    deny: z.array(z.string().min(1)).default([]),
+    readable: z.array(RepoPattern).default([]),
+    /**
+     * Explicitly unreadable, wins over `readable` (RepoPattern). Like other arrays, a repo layer's
+     * list replaces the `defaults` one (`policyFileWarnings` reports entries dropped that way).
+     */
+    deny: z.array(RepoPattern).default([]),
     /**
      * Dependency hints injected into the prompt so the agent searches the right place first,
      * e.g. { "acme/web": "calls /orders API from src/api/orders.ts" }.
@@ -357,9 +372,14 @@ export type PolicyLayer = z.infer<typeof PolicyLayer>;
 
 export const MirrorPolicy = z
   .object({
-    /** Repos to mirror. Exact owner/name, or "owner/*" (resolved via the GitHub API at sync). */
+    /**
+     * Repos to mirror. Exact owner/name, or "owner/*" (resolved via the GitHub API at sync). Other
+     * entries are accepted here but fail (per entry) on every `xrepo sync` run; `policyFileWarnings`
+     * reports them.
+     */
     repos: z.array(z.string().min(1)).default([]),
-    exclude: z.array(z.string().min(1)).default([]),
+    /** Never mirrored (RepoPattern: "owner/name", "owner/*" or "*"; other forms are rejected). */
+    exclude: z.array(RepoPattern).default([]),
     keep_snapshots: z.number().int().min(1).max(10).default(2),
     /** Skip archived repos / forks when expanding owner/* */
     skip_archived: z.boolean().default(true),

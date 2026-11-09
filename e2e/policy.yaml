@@ -1,0 +1,73 @@
+# Policy for this project's own end-to-end test (.github/workflows/e2e.yml, hosted mode).
+#
+# The repository under review is xrepo-review itself (whatever its name is in your fork), so
+# everything is configured in `defaults`. Two fixture services are mirrored from bare repos that
+# the workflow builds out of e2e/fixtures/ (see e2e/make-bare-repos.mjs):
+#   /repos/acme/api  createOrder(customerId, items, opts: {currency})
+#   /repos/acme/web  its consumer
+# The e2e pull request breaks the consumer; the review must find it (outcome completed,
+# findings >= 1) and block via the check-run.
+version: 1
+
+defaults:
+  capabilities:
+    inline_comments:
+      enabled: true
+      max_comments: 10
+      min_severity: low
+      suggestions: true
+    summary_comment:
+      enabled: true
+      mode: sticky
+    approve:
+      enabled: false
+    block:
+      enabled: true
+      method: check
+      min_severity: high
+    check:
+      enabled: true
+      name: xrepo-review-e2e
+    labels:
+      enabled: false
+
+  cross_repo:
+    readable: ["acme/*"]
+    related:
+      acme/api: "defines createOrder(customerId, items, opts) in src/orders.ts; opts.currency is required since 2.0"
+      acme/web: "calls createOrder from src/checkout.ts (cart -> order)"
+
+  triggers:
+    skip_drafts: true
+    skip_forks: true
+    skip_bots: true
+    max_changed_files: 80
+    max_changed_lines: 4000
+
+  agent:
+    max_turns: 30
+    instructions: |
+      This run is the end-to-end test of the xrepo-review project. In /pr the two fixture services
+      live under /pr/e2e/fixtures/acme/api and /pr/e2e/fixtures/acme/web; their default-branch
+      snapshots are /repos/acme/api and /repos/acme/web. Review the changes under e2e/fixtures/
+      as if they were changes to those services; treat calls between them as cross-repo contracts.
+
+  output:
+    link_allowlist: ["github.com"]
+    footer: "xrepo-review end-to-end test"
+
+  outcomes:
+    completed:
+      comment: "✅ e2e: review completed with {findings} finding(s), top severity {top_severity}."
+    blocked:
+      comment: "⛔ e2e: blocking finding(s) reported; the xrepo-review-e2e check fails as expected for a broken consumer."
+    incomplete:
+      comment: "⚠️ e2e: the review did not finish ({reason}). [Run log]({run_url})"
+    usage_limit:
+      comment: "⏸️ e2e: Claude usage limit reached{reset_at_suffix}; re-run the e2e workflow later."
+    error:
+      comment: "⚠️ e2e: the review could not run ({reason}). [Run log]({run_url})"
+
+mirror:
+  repos: ["acme/api", "acme/web"]
+  keep_snapshots: 2

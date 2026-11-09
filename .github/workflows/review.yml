@@ -1,0 +1,564 @@
+# xrepo-review: reusable workflow (on: workflow_call).
+#
+# Callers add ~15 lines (examples/caller.yml):
+#   jobs:
+#     review:
+#       permissions: { contents: read, pull-requests: write, issues: write, checks: write }
+#       uses: <org>/xrepo-review/.github/workflows/review.yml@<commit sha>
+#       secrets: inherit
+#
+# Two jobs:
+#   review   READ-ONLY token. Checks out the PR head (never executed), runs `xrepo prepare`, then
+#            anthropics/claude-code-action@v1 with exactly two MCP servers (xsearch, xreview) in
+#            hardened containers, and uploads ctx + draft + a trimmed execution log as an artifact
+#            (its name is the job output `artifact`).
+#   publish  The only job with a write token. No PR checkout. Downloads exactly that artifact,
+#            re-resolves the policy from the trusted manifest and runs the deterministic publisher
+#            (`xrepo publish`, no AI). Fails closed: when the review job uploaded its context but it
+#            cannot be downloaded, nothing is published (no "error" comment, no neutral check).
+#
+# Re-runs: "Re-run all jobs" (and the `xrepo retry` sweeper) review again. "Re-run this job" on
+# publish, or "Re-run failed jobs" when only publish failed, republishes the same review from the
+# artifact of the attempt that produced it (3-day retention; once expired, publish fails without
+# changing anything and only a full re-run helps).
+#
+# Token limits of the publish job (deliberate): `contents: read`, so repository_dispatch outcome
+# actions (which need contents: write) always use the XREPO_DISPATCH_TOKEN secret, also for the PR's
+# own repository. On pull_request events from forks GitHub makes the token read-only whatever the
+# caller grants; a review prepare skipped there (skip_forks) still ends green: the skipped check /
+# comment are best effort and a dry run decides the exit code. When xrepo_ref is set (always in
+# hosted mode) and xrepo_repo is private, a fork run cannot even check out the trusted source (it
+# gets no secrets, and github.token reads only the calling repository): the review job then stops
+# right after that checkout with a notice, the publish job is skipped, nothing is published and the
+# run still ends green (output skip_reason says why).
+#
+# Modes:
+#   self-hosted (default)  policy and mirror live on the runner host (policy_path, mirror_path);
+#                          the `xrepo` CLI is on PATH and the image exists locally, unless xrepo_ref
+#                          is given (then both are built from xrepo_repo@xrepo_ref).
+#   hosted                 GitHub-hosted runners: xrepo_repo@xrepo_ref (a commit SHA) is checked out
+#                          into .xrepo-src, the CLI and image are built from it (or `image` is a
+#                          registry reference, preferred), the policy is .xrepo-src/<policy_file>
+#                          and the mirror is synced inside the job.
+#
+# Outputs (workflow_call): outcome, verdict, reason, reset_at, findings, top_severity,
+# fired_outcomes, skip_reason. Chain your own jobs on them, e.g.
+# `if: needs.review.outputs.outcome == 'usage_limit'` (examples/caller-with-hooks.yml). Whether the
+# PR was actually blocked / approved is `contains(needs.review.outputs.fired_outcomes, 'blocked')`
+# (or 'approved'): verdict alone does not say whether the publisher's rules and GitHub let it through.
+#
+# SECURITY (docs/SECURITY.md): on pull_request triggers the CALLER workflow file comes from the PR
+# head, so a PR author with write access can edit how this workflow is called. Production must use
+# an org ruleset "Require workflows to pass before merging" (or required status checks) plus
+# CODEOWNERS on .github/workflows/, and pin this workflow, the action and the image by SHA/digest.
+name: xrepo-review
+
+on:
+  workflow_call:
+    inputs:
+      mode:
+        description: "'self-hosted' (policy + mirror on the runner host) or 'hosted' (GitHub-hosted runners)."
+        type: string
+        default: self-hosted
+      runner_labels:
+        description: "JSON array of runner labels, e.g. '[\"self-hosted\",\"xrepo-review\"]' or '[\"ubuntu-latest\"]'."
+        type: string
+        default: '["self-hosted","xrepo-review"]'
+      policy_path:
+        description: "self-hosted: absolute path of the policy manifest on the runner (root-owned, read-only)."
+        type: string
+        default: /etc/xrepo-review/policy.yaml
+      mirror_path:
+        description: "self-hosted: mirror root maintained by `xrepo sync` (read-only to review jobs)."
+        type: string
+        default: /srv/xrepo/mirror
+      image:
+        description: "MCP server image. A registry reference (ghcr.io/org/xrepo-review@sha256:...) is pulled; a bare name is built from .xrepo-src when xrepo_ref is set, else must exist on the runner."
+        type: string
+        default: xrepo-review:latest
+      launcher:
+        description: "docker (hardened containers, production) or local (node on the runner; development only, no isolation)."
+        type: string
+        default: docker
+      fetch_depth:
+        description: "Commits fetched for the PR checkout (0 = all; base...head needs the merge base, otherwise the diff comes from the GitHub API)."
+        type: number
+        default: 0
+      xrepo_repo:
+        description: "Repository holding the xrepo-review source (hosted mode, or self-hosted with xrepo_ref)."
+        type: string
+        default: dudibuilds/claude-review
+      xrepo_ref:
+        description: "Commit SHA (40 hex) of xrepo_repo to build the CLI / image and read the policy from. Required in hosted mode."
+        type: string
+        default: ""
+      policy_file:
+        description: "hosted: policy path inside the trusted xrepo checkout (never the PR checkout)."
+        type: string
+        default: .github/xrepo/policy.yaml
+      mirror_url_template:
+        description: "hosted: `xrepo sync --url-template` ({owner}, {repo}; {workspace} = $GITHUB_WORKSPACE). Empty = https://github.com/{owner}/{repo}.git."
+        type: string
+        default: ""
+      pr_number:
+        description: "PR number when the caller's event is not pull_request (e.g. workflow_dispatch)."
+        type: string
+        default: ""
+    secrets:
+      # Read with `secrets: inherit` (documented here; declare nothing else in the caller).
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: "Claude subscription token (claude setup-token). Per repo group: an org secret with the same name scoped to that group's repos. Wins over ANTHROPIC_API_KEY when both are visible."
+        required: false
+      ANTHROPIC_API_KEY:
+        description: "Alternative to CLAUDE_CODE_OAUTH_TOKEN, used only when CLAUDE_CODE_OAUTH_TOKEN is not visible to the calling repository (Claude Code itself would prefer the API key, so it is not passed when both are set)."
+        required: false
+      XREPO_GITHUB_TOKEN:
+        description: "hosted: token with contents:read on the mirrored repos (and xrepo_repo if private). Falls back to github.token."
+        required: false
+      XREPO_NOTIFY_SECRETS:
+        description: "JSON object with notification URLs / HMAC keys referenced by the policy (publish job only)."
+        required: false
+      XREPO_DISPATCH_TOKEN:
+        description: "Token for repository_dispatch outcome actions (publish job only), with contents:write on every target repository. Required for ANY dispatch, also to the PR's own repository: the publish job's github.token has contents:read only."
+        required: false
+    outputs:
+      outcome:
+        description: "completed | incomplete | usage_limit | error | skipped"
+        value: ${{ jobs.publish.outputs.outcome }}
+      verdict:
+        description: "Verdict after the publisher's rules: comment | approve | request_changes (empty for skipped, error and usage_limit runs). Use fired_outcomes to tell whether the PR was really blocked / approved."
+        value: ${{ jobs.publish.outputs.verdict }}
+      reason:
+        description: "One-line reason for the outcome"
+        value: ${{ jobs.publish.outputs.reason }}
+      reset_at:
+        description: "Usage-limit reset time (ISO-8601 or the CLI's text), when known"
+        value: ${{ jobs.publish.outputs.reset_at }}
+      findings:
+        description: "Number of distinct findings in the draft"
+        value: ${{ jobs.publish.outputs.findings }}
+      top_severity:
+        description: "Highest finding severity (info..critical), empty if none"
+        value: ${{ jobs.publish.outputs.top_severity }}
+      fired_outcomes:
+        description: "Every outcome that fired, primary first, comma-separated (e.g. completed,blocked)"
+        value: ${{ jobs.publish.outputs.fired_outcomes }}
+      skip_reason:
+        description: "Why prepare skipped the review (empty when it ran)"
+        value: ${{ jobs.review.outputs.skip_reason }}
+
+# Nothing by default; each job asks for exactly what it needs (a called workflow can only reduce
+# the caller's grant).
+permissions: {}
+
+jobs:
+  review:
+    name: review
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 45
+    # READ-ONLY: the agent's job never holds a token that can write to GitHub.
+    permissions:
+      contents: read
+      pull-requests: read
+    concurrency:
+      group: xrepo-review-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: true
+    outputs:
+      skip: ${{ steps.prepare.outputs.skip }}
+      skip_reason: ${{ steps.prepare.outputs.skip_reason || steps.fork-stop.outputs.skip_reason }}
+      # 'true' when a fork run could not check out the trusted xrepo source (see fork-stop): the
+      # publish job is skipped.
+      fork_stopped: ${{ steps.fork-stop.outputs.stopped }}
+      agent_outcome: ${{ steps.claude.outcome }}
+      # Name of the artifact this job uploaded ('' when it uploaded none). The publish job downloads
+      # exactly this name. Re-running only the publish job bumps github.run_attempt but keeps this
+      # job's outputs and artifact from the attempt that produced them, so the name travels as an
+      # output and is never recomputed from run_attempt in the publish job.
+      artifact: ${{ steps.upload.outputs.artifact-id && format('xrepo-review-{0}', github.run_attempt) || '' }}
+    steps:
+      # Every input / event value reaches the shell through env, never through ${{ }} in `run`
+      # (no script injection from PR titles, branch names or caller inputs).
+      - name: Check inputs
+        env:
+          MODE: ${{ inputs.mode }}
+          LAUNCHER: ${{ inputs.launcher }}
+          XREPO_REF: ${{ inputs.xrepo_ref }}
+          POLICY_PATH: ${{ inputs.policy_path }}
+          POLICY_FILE: ${{ inputs.policy_file }}
+          MIRROR_PATH: ${{ inputs.mirror_path }}
+          EVENT_PR: ${{ github.event.pull_request.number }}
+          INPUT_PR: ${{ inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          case "$MODE" in self-hosted|hosted) ;; *) fail "mode must be self-hosted or hosted";; esac
+          case "$LAUNCHER" in docker|local) ;; *) fail "launcher must be docker or local";; esac
+          if [ -n "$XREPO_REF" ] && ! [[ "$XREPO_REF" =~ ^[0-9a-f]{40}$ ]]; then fail "xrepo_ref must be a full commit SHA"; fi
+          if [ "$MODE" = hosted ] && [ -z "$XREPO_REF" ]; then fail "hosted mode needs xrepo_ref (a commit SHA of xrepo_repo)"; fi
+          if [ -z "$EVENT_PR" ] && ! [[ "$INPUT_PR" =~ ^[1-9][0-9]*$ ]]; then fail "not a pull_request event: pass pr_number"; fi
+          for v in "$POLICY_PATH" "$POLICY_FILE" "$MIRROR_PATH"; do
+            [[ "$v" != *$'\n'* && "$v" != *$'\r'* ]] || fail "paths must not contain line breaks"
+          done
+          case "$POLICY_FILE" in /*|../*|*/../*|*/..|..) fail "policy_file must be a relative path inside the xrepo checkout";; esac
+
+      - name: Resolve paths
+        id: paths
+        env:
+          MODE: ${{ inputs.mode }}
+          POLICY_PATH: ${{ inputs.policy_path }}
+          POLICY_FILE: ${{ inputs.policy_file }}
+          MIRROR_PATH: ${{ inputs.mirror_path }}
+        run: |
+          set -euo pipefail
+          if [ "$MODE" = hosted ]; then
+            policy="$GITHUB_WORKSPACE/.xrepo-src/$POLICY_FILE"
+            mirror="$RUNNER_TEMP/xrepo-mirror"
+          else
+            policy="$POLICY_PATH"
+            mirror="$MIRROR_PATH"
+          fi
+          {
+            echo "policy=$policy"
+            echo "mirror=$mirror"
+            echo "work=$RUNNER_TEMP/xrepo-work"
+          } >> "$GITHUB_OUTPUT"
+
+      # Trusted xrepo source: a pinned commit, checked out next to (never inside) the PR checkout.
+      # A pull request from a fork gets no secrets and a github.token that reads only this
+      # repository, so a private xrepo_repo cannot be checked out there. Only for such runs a failed
+      # checkout does not fail the job: the fork-stop step below ends the review instead (every later
+      # step checks steps.xrepo-src.outcome), and the publish job is skipped.
+      - name: Check out xrepo-review (trusted, pinned)
+        id: xrepo-src
+        if: inputs.xrepo_ref != ''
+        continue-on-error: ${{ github.event.pull_request != null && github.event.pull_request.head.repo.full_name != github.repository }}
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.xrepo_repo }}
+          ref: ${{ inputs.xrepo_ref }}
+          path: .xrepo-src
+          token: ${{ secrets.XREPO_GITHUB_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Stop (a fork pull request cannot read xrepo_repo)
+        id: fork-stop
+        if: steps.xrepo-src.outcome == 'failure'
+        env:
+          XREPO_REPO: ${{ inputs.xrepo_repo }}
+        run: |
+          set -euo pipefail
+          reason="pull request from a fork: this run cannot read ${XREPO_REPO} (fork runs get no secrets)"
+          echo "::notice::Not reviewed: ${reason}. Fork pull requests are not reviewed (skip_forks); nothing is published and the run stays green. To write a skipped check for them, make ${XREPO_REPO} readable to fork runs (public, or secrets sent to fork pull request workflows)."
+          {
+            echo "stopped=true"
+            echo "skip_reason=${reason}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        if: inputs.xrepo_ref != '' && steps.xrepo-src.outcome != 'failure'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build the xrepo CLI
+        if: inputs.xrepo_ref != '' && steps.xrepo-src.outcome != 'failure'
+        working-directory: .xrepo-src
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          mkdir -p "$RUNNER_TEMP/xrepo-bin"
+          printf '#!/bin/sh\nexec node "%s" "$@"\n' "$PWD/dist/cli.js" > "$RUNNER_TEMP/xrepo-bin/xrepo"
+          chmod 0755 "$RUNNER_TEMP/xrepo-bin/xrepo"
+          echo "$RUNNER_TEMP/xrepo-bin" >> "$GITHUB_PATH"
+
+      - name: Locate the xrepo CLI
+        if: steps.xrepo-src.outcome != 'failure'
+        run: |
+          command -v xrepo || { echo "::error::xrepo is not on PATH (install it on the runner or pass xrepo_ref)"; exit 1; }
+          xrepo --version
+
+      - name: Provide the MCP server image
+        if: inputs.launcher == 'docker' && steps.xrepo-src.outcome != 'failure'
+        env:
+          IMAGE: ${{ inputs.image }}
+        run: |
+          set -euo pipefail
+          if [[ "$IMAGE" == */* ]]; then
+            docker pull "$IMAGE"
+          elif [ -d .xrepo-src ]; then
+            docker build -f .xrepo-src/docker/Dockerfile -t "$IMAGE" .xrepo-src
+          else
+            docker image inspect "$IMAGE" > /dev/null || { echo "::error::image $IMAGE not found on the runner"; exit 1; }
+          fi
+
+      # ---- hosted mode: build the mirror inside the job ----
+      - name: Build fixture repositories (e2e)
+        if: inputs.mode == 'hosted' && contains(inputs.mirror_url_template, 'fixtures-bare') && steps.xrepo-src.outcome != 'failure'
+        run: node .xrepo-src/e2e/make-bare-repos.mjs .xrepo-src/e2e/fixtures .xrepo-src/e2e/fixtures-bare
+
+      - name: Mirror cache key
+        id: mirror-key
+        if: inputs.mode == 'hosted' && inputs.mirror_url_template == '' && steps.xrepo-src.outcome != 'failure'
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      # PR runs restore entries saved by earlier runs of the same PR or on the default branch (never
+      # a sibling PR's): .github/workflows/mirror-cache.yml saves this key on the default branch.
+      - name: Restore mirror cache
+        if: inputs.mode == 'hosted' && inputs.mirror_url_template == '' && steps.xrepo-src.outcome != 'failure'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.paths.outputs.mirror }}
+          key: xrepo-mirror-${{ hashFiles(format('.xrepo-src/{0}', inputs.policy_file)) }}-${{ steps.mirror-key.outputs.date }}
+          restore-keys: |
+            xrepo-mirror-${{ hashFiles(format('.xrepo-src/{0}', inputs.policy_file)) }}-
+
+      - name: Sync mirror (hosted)
+        if: inputs.mode == 'hosted' && steps.xrepo-src.outcome != 'failure'
+        env:
+          # Only this step sees the mirror token; the agent step does not.
+          XREPO_GITHUB_TOKEN: ${{ secrets.XREPO_GITHUB_TOKEN || github.token }}
+          TEMPLATE: ${{ inputs.mirror_url_template }}
+          POLICY: ${{ steps.paths.outputs.policy }}
+          MIRROR: ${{ steps.paths.outputs.mirror }}
+        run: |
+          set -euo pipefail
+          args=(sync --policy "$POLICY" --mirror "$MIRROR")
+          if [ -n "$TEMPLATE" ]; then
+            args+=(--url-template "${TEMPLATE//\{workspace\}/$GITHUB_WORKSPACE}")
+          fi
+          rc=0
+          xrepo "${args[@]}" || rc=$?
+          # A partial mirror only limits cross-repo search; it never blocks the review.
+          if [ "$rc" -ne 0 ]; then echo "::warning::xrepo sync exited with $rc; cross-repo search may be incomplete"; fi
+
+      # ---- the PR: checked out as data, never built or executed ----
+      - name: Check out the PR head (data only)
+        if: steps.xrepo-src.outcome != 'failure'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || format('refs/pull/{0}/head', inputs.pr_number) }}
+          path: pr
+          fetch-depth: ${{ inputs.fetch_depth }}
+          persist-credentials: false
+          submodules: false
+          lfs: false
+
+      - name: Prepare the review
+        id: prepare
+        if: steps.xrepo-src.outcome != 'failure'
+        env:
+          # Read-only token: GitHub API diff fallback / PR lookup for workflow_dispatch.
+          GITHUB_TOKEN: ${{ github.token }}
+          POLICY: ${{ steps.paths.outputs.policy }}
+          MIRROR: ${{ steps.paths.outputs.mirror }}
+          WORK: ${{ steps.paths.outputs.work }}
+          LAUNCHER: ${{ inputs.launcher }}
+          IMAGE: ${{ inputs.image }}
+          MODE: ${{ inputs.mode }}
+          POLICY_FILE: ${{ inputs.policy_file }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          # prepare refuses a policy inside the PR checkout, the work dir or the mirror, and turns
+          # $GITHUB_WORKSPACE (claude-code-action's working directory) into an empty git repo.
+          args=(prepare
+            --policy "$POLICY"
+            --repo "$GITHUB_REPOSITORY"
+            --pr "$PR_NUMBER"
+            --pr-checkout "$GITHUB_WORKSPACE/pr"
+            --mirror "$MIRROR"
+            --work "$WORK"
+            --event "$GITHUB_EVENT_PATH"
+            --launcher "$LAUNCHER"
+            --image "$IMAGE"
+            --action-cwd "$GITHUB_WORKSPACE")
+          # hosted: the policy is a file of xrepo_repo, which may also be mirrored; xsearch then
+          # hides that path in every /repos root (besides the built-in .github/xrepo/).
+          if [ "$MODE" = hosted ]; then args+=(--policy-repo-path "$POLICY_FILE"); fi
+          xrepo "${args[@]}"
+
+      - name: Review with Claude
+        id: claude
+        if: steps.prepare.outputs.skip == 'false'
+        # The publish job classifies failures (usage limit, error, incomplete) and reports them.
+        continue-on-error: true
+        timeout-minutes: 30
+        # Pin by full commit SHA (this is v1 / v1.0.269). Bump deliberately after reviewing changes.
+        uses: anthropics/claude-code-action@61a9c274fa7110a66dfafc1bbbced03833eb25fe # v1.0.269
+        env:
+          # Belt and braces next to `_meta: {"anthropic/alwaysLoad": true}` on every MCP tool:
+          # never defer MCP tools behind ToolSearch (which is disabled anyway).
+          ENABLE_TOOL_SEARCH: "false"
+        with:
+          # Exactly one credential: Claude Code prefers ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN,
+          # so an API key visible to the repository (e.g. an org secret meant for other workflows)
+          # would silently replace the per-group subscription token. The subscription token wins;
+          # the API key is passed only when no CLAUDE_CODE_OAUTH_TOKEN is visible.
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          anthropic_api_key: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN == '' && secrets.ANTHROPIC_API_KEY || '' }}
+          # Read-only job token: the action only reads (permission check, base-branch fetch).
+          github_token: ${{ github.token }}
+          prompt: ${{ steps.prepare.outputs.prompt }}
+          # --mcp-config <work>/agent/mcp.json --strict-mcp-config --setting-sources user --tools ,
+          # --allowedTools <exact xsearch/xreview names> --disallowedTools <built-ins> --max-turns N
+          claude_args: ${{ steps.prepare.outputs.claude_args }}
+          plugins: ${{ steps.prepare.outputs.plugins }}
+          plugin_marketplaces: ${{ steps.prepare.outputs.plugin_marketplaces }}
+
+      - name: Collect the agent outcome
+        if: always() && steps.prepare.outcome == 'success'
+        continue-on-error: true
+        env:
+          WORK: ${{ steps.paths.outputs.work }}
+          AGENT_OUTCOME: ${{ steps.claude.outcome }}
+          EXECUTION_FILE: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          # Trims the execution log (drops tool results = other repos' code) before it becomes an artifact.
+          xrepo collect --work "$WORK" --agent-outcome "$AGENT_OUTCOME" ${EXECUTION_FILE:+--execution-file "$EXECUTION_FILE"}
+
+      - name: Upload the review artifact
+        id: upload
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: xrepo-review-${{ github.run_attempt }}
+          path: |
+            ${{ steps.paths.outputs.work }}/ctx
+            ${{ steps.paths.outputs.work }}/out
+            ${{ steps.paths.outputs.work }}/execution.json
+            ${{ steps.paths.outputs.work }}/agent-outcome.txt
+          retention-days: 3
+          if-no-files-found: warn
+          include-hidden-files: false
+
+  publish:
+    name: publish
+    needs: review
+    # Runs after success, failure and skip of the review job; not when the run was cancelled
+    # (a newer push superseded it), and not when a fork run could not read the trusted source
+    # (review job output fork_stopped: this job could not check it out either).
+    if: ${{ !cancelled() && needs.review.outputs.fork_stopped != 'true' }}
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 15
+    # The ONLY job with a write token. It never checks out PR code.
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      checks: write
+    concurrency:
+      group: xrepo-review-publish-${{ github.repository }}-${{ github.event.pull_request.number || inputs.pr_number }}
+      cancel-in-progress: false
+    outputs:
+      outcome: ${{ steps.publish.outputs.outcome }}
+      verdict: ${{ steps.publish.outputs.verdict }}
+      reason: ${{ steps.publish.outputs.reason }}
+      reset_at: ${{ steps.publish.outputs.reset_at }}
+      findings: ${{ steps.publish.outputs.findings }}
+      top_severity: ${{ steps.publish.outputs.top_severity }}
+      fired_outcomes: ${{ steps.publish.outputs.fired_outcomes }}
+    steps:
+      - name: Check out xrepo-review (trusted, pinned)
+        if: inputs.xrepo_ref != ''
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.xrepo_repo }}
+          ref: ${{ inputs.xrepo_ref }}
+          path: .xrepo-src
+          token: ${{ secrets.XREPO_GITHUB_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        if: inputs.xrepo_ref != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build the xrepo CLI
+        if: inputs.xrepo_ref != ''
+        working-directory: .xrepo-src
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          mkdir -p "$RUNNER_TEMP/xrepo-bin"
+          printf '#!/bin/sh\nexec node "%s" "$@"\n' "$PWD/dist/cli.js" > "$RUNNER_TEMP/xrepo-bin/xrepo"
+          chmod 0755 "$RUNNER_TEMP/xrepo-bin/xrepo"
+          echo "$RUNNER_TEMP/xrepo-bin" >> "$GITHUB_PATH"
+
+      - name: Download the review artifact
+        # Exactly the artifact the review job reports, never xrepo-review-<this job's run_attempt>:
+        # a re-run of only this job has a new run_attempt but the review job's artifact and outputs
+        # from the attempt that produced them. No artifact when the review job failed before
+        # uploading one; publish then reports outcome "error". A failed download is caught by the
+        # Publish step, which then refuses to publish (fail closed).
+        if: needs.review.outputs.artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.review.outputs.artifact }}
+          path: ${{ runner.temp }}/xrepo-review
+
+      - name: Publish
+        id: publish
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          XREPO_NOTIFY_SECRETS: ${{ secrets.XREPO_NOTIFY_SECRETS }}
+          XREPO_DISPATCH_TOKEN: ${{ secrets.XREPO_DISPATCH_TOKEN }}
+          MODE: ${{ inputs.mode }}
+          POLICY_PATH: ${{ inputs.policy_path }}
+          POLICY_FILE: ${{ inputs.policy_file }}
+          SKIP: ${{ needs.review.outputs.skip }}
+          SKIP_REASON: ${{ needs.review.outputs.skip_reason }}
+          AGENT_OUTCOME: ${{ needs.review.outputs.agent_outcome }}
+          REVIEW_RESULT: ${{ needs.review.result }}
+          ARTIFACT: ${{ needs.review.outputs.artifact }}
+          # "true" for a pull_request whose head lives in another repository (a fork, or a deleted
+          # one): GitHub gives those runs a read-only token whatever `permissions:` say.
+          FORK_PR: ${{ github.event.pull_request && github.event.pull_request.head.repo.full_name != github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          D="$RUNNER_TEMP/xrepo-review"
+          # Fail closed. Once prepare succeeded, the review job always uploads ctx/pr.json, so a
+          # missing context here means the artifact could not be downloaded (expired, or not
+          # visible to this re-run). Publishing anyway would report "the review job failed before
+          # the agent ran", overwrite the review summary and post a neutral check over a failing one.
+          if [ ! -f "$D/ctx/pr.json" ] && { [ -n "$ARTIFACT" ] || [ "$REVIEW_RESULT" = success ]; }; then
+            echo "::error::The review job uploaded its context (artifact ${ARTIFACT:-unknown}, result ${REVIEW_RESULT:-unknown}) but it is not available here. Nothing was published: the pull request keeps its current review, comment and check. Re-run all jobs to review it again."
+            exit 1
+          fi
+          mkdir -p "$D/ctx" "$D/out"
+          if [ "$MODE" = hosted ]; then policy="$GITHUB_WORKSPACE/.xrepo-src/$POLICY_FILE"; else policy="$POLICY_PATH"; fi
+          # Never trust a resolved policy that passed through the agent's job: the publisher
+          # re-resolves it from the trusted manifest (--policy).
+          rm -f "$D/ctx/policy.resolved.json"
+          # repository_dispatch needs contents: write, which this job's token deliberately lacks, so
+          # every dispatch (to this repository too) needs XREPO_DISPATCH_TOKEN. Say so up front
+          # instead of only auditing a 403 per dispatch.
+          if [ -z "${XREPO_DISPATCH_TOKEN:-}" ]; then
+            resolved="$(xrepo policy resolve "$policy" "$GITHUB_REPOSITORY" 2> /dev/null || true)"
+            if grep -q '"dispatch": {' <<< "$resolved"; then
+              echo "::warning::The policy configures repository_dispatch outcome actions for $GITHUB_REPOSITORY, but the XREPO_DISPATCH_TOKEN secret is not set. This job's token has contents: read only, so those dispatches will fail. Add XREPO_DISPATCH_TOKEN (contents: write on the target repositories)."
+            fi
+          fi
+          agent="$AGENT_OUTCOME"
+          if [ -z "$agent" ] && [ -f "$D/agent-outcome.txt" ]; then agent="$(head -c 40 "$D/agent-outcome.txt" | tr -cd 'a-z_')"; fi
+          if [ -z "$agent" ]; then agent="$REVIEW_RESULT"; fi
+          args=(publish --ctx "$D/ctx" --draft "$D/out/draft.jsonl" --policy "$policy"
+                --run-url "$RUN_URL" --run-attempt "$GITHUB_RUN_ATTEMPT")
+          if [ -n "$agent" ]; then args+=(--agent-outcome "$agent"); fi
+          if [ -f "$D/execution.json" ]; then args+=(--execution-file "$D/execution.json"); fi
+          if [ "$SKIP" = "true" ]; then args+=(--skip-reason "${SKIP_REASON:-skipped by policy}"); fi
+          rc=0
+          xrepo "${args[@]}" || rc=$?
+          if [ "$rc" -ne 0 ] && [ "$SKIP" = "true" ] && [ "$FORK_PR" = "true" ]; then
+            # The fork run's read-only token cannot write the skipped check / comment. Nothing was
+            # reviewed, so nothing is lost: a dry run (no API calls) decides the exit code, which
+            # then fails only for a policy `fail_job` on `skipped`.
+            echo "::warning::The skipped check / comment could not be written: pull requests from forks get a read-only token. The review was skipped by policy (${SKIP_REASON:-skipped})."
+            rc=0
+            xrepo "${args[@]}" --dry-run > /dev/null || rc=$?
+          fi
+          exit "$rc"

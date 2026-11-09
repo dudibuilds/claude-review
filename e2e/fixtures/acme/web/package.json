@@ -1,0 +1,9 @@
+{
+  "name": "@acme/web",
+  "version": "1.4.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@acme/api": "^2.0.0"
+  }
+}

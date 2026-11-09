@@ -55,8 +55,83 @@ export function compileGlobs(globs: string[]): (relPath: string) => boolean {
   };
 }
 
+/* --------------------------- repository patterns -------------------------- */
+
+/**
+ * The one grammar of repository names and patterns (cross_repo.readable / deny, mirror.repos /
+ * exclude). Names follow what `xrepo sync` mirrors and xsearch serves (sync isValidRepoName,
+ * search/vfs.ts isMirrorRepoName): an owner starts alphanumeric; a repository name may start with
+ * "." (".github") but is never ".", ".." or ".git"; both are [A-Za-z0-9_.-], at most 100 chars.
+ */
+const OWNER_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/;
+const NAME_RE = /^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,99}$/;
+
+/** Human-readable list of the supported repository pattern forms (for error messages). */
+export const REPO_PATTERN_FORMS = "owner/name, owner/* or *";
+
+export function isRepoOwner(s: string): boolean {
+  return typeof s === "string" && OWNER_RE.test(s);
+}
+
+/** Exact "owner/name" in the grammar above (case is preserved; matching ignores it). */
+export function isExactRepoName(s: string): boolean {
+  if (typeof s !== "string") return false;
+  const parts = s.split("/");
+  if (parts.length !== 2) return false;
+  const [owner, name] = parts as [string, string];
+  return OWNER_RE.test(owner) && NAME_RE.test(name) && name !== "." && name !== ".." && name.toLowerCase() !== ".git";
+}
+
+/**
+ * Kind of a repository pattern, or undefined when it is not one of the supported forms:
+ * "all" for "*", "owner" for "owner/*", "exact" for "owner/name". Anything else (other globs such
+ * as "acme/legacy-*" or "*\/secrets", a trailing "/", a URL, extra segments, surrounding
+ * whitespace) is unsupported: repoPatternMatch would never match it, which silently fails open in
+ * a deny list, so the schema rejects it.
+ */
+export function repoPatternKind(pattern: string): "all" | "owner" | "exact" | undefined {
+  if (typeof pattern !== "string") return undefined;
+  if (pattern === "*") return "all";
+  if (pattern.endsWith("/*")) return isRepoOwner(pattern.slice(0, -2)) ? "owner" : undefined;
+  return isExactRepoName(pattern) ? "exact" : undefined;
+}
+
+/** Problem with a repository pattern (undefined when supported), naming the pattern. */
+export function repoPatternProblem(pattern: string, opts: { allowAll?: boolean } = {}): string | undefined {
+  const kind = repoPatternKind(pattern);
+  const allowAll = opts.allowAll ?? true;
+  if (kind !== undefined && (allowAll || kind !== "all")) return undefined;
+  const forms = allowAll ? REPO_PATTERN_FORMS : "owner/name or owner/*";
+  const hint = kind === undefined && pattern.includes("*") ? "; other globs are not supported, list repositories by name" : "";
+  return `${JSON.stringify(pattern)} is not a supported repository pattern (expected ${forms}${hint})`;
+}
+
+/**
+ * True when every repository `inner` matches is also matched by `outer` (both supported patterns,
+ * case-insensitive). Unsupported patterns never cover and are never covered.
+ */
+export function repoPatternCovers(outer: string, inner: string): boolean {
+  const ko = repoPatternKind(outer);
+  const ki = repoPatternKind(inner);
+  if (ko === undefined || ki === undefined) return false;
+  if (ko === "all") return true;
+  if (ki === "all") return false;
+  const ownerOf = (p: string): string => p.slice(0, p.indexOf("/")).toLowerCase();
+  if (ko === "owner") return ownerOf(outer) === ownerOf(inner);
+  return ki === "exact" && outer.toLowerCase() === inner.toLowerCase();
+}
+
+/**
+ * True when some repository could match both patterns (supported patterns only). For these three
+ * forms, two patterns overlap exactly when one covers the other.
+ */
+export function repoPatternsOverlap(a: string, b: string): boolean {
+  return repoPatternCovers(a, b) || repoPatternCovers(b, a);
+}
+
 /**
  * Repo pattern match: "owner/name" (exact, case-insensitive), "owner/*" (any repo of owner) or "*".
+ * Other patterns never match (see repoPatternKind; the policy schema rejects them).
  */
 export function repoPatternMatch(pattern: string, repo: string): boolean {
   const p = pattern.trim().toLowerCase();

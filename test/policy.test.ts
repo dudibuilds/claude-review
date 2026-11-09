@@ -2,16 +2,27 @@ import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import { compileGlobs, repoPatternMatch } from "../src/policy/glob.js";
 import {
+  compileGlobs,
+  isExactRepoName,
+  repoPatternCovers,
+  repoPatternKind,
+  repoPatternMatch,
+  repoPatternProblem,
+} from "../src/policy/glob.js";
+import {
+  KILL_SWITCH_REASON,
   PolicyError,
+  killSwitchReason,
   loadPolicy,
   parsePolicy,
   readResolvedPolicy,
+  policyFileWarnings,
   readableRepos,
   resolvePolicy,
 } from "../src/policy/load.js";
-import { DEFAULT_DENY_GLOBS, DEFAULT_EXCLUDE_GLOBS, OUTCOMES } from "../src/policy/schema.js";
+import { shouldSkip } from "../src/prepare/prepare.js";
+import { DEFAULT_DENY_GLOBS, DEFAULT_EXCLUDE_GLOBS, OUTCOMES, type ResolvedPolicy } from "../src/policy/schema.js";
 
 let dir: string;
 beforeAll(() => {
@@ -506,5 +517,298 @@ describe("loadPolicy / readResolvedPolicy", () => {
     expect(errorOf(() => readResolvedPolicy(p)).message).toContain("extra: unknown key");
     writeFileSync(p, "{not json");
     expect(() => readResolvedPolicy(p)).toThrow(PolicyError);
+  });
+});
+
+/* ------------------------------ kill switch ----------------------------- */
+
+describe("killSwitchReason (enabled: false kill switch)", () => {
+  const PR = { title: "Add orders", author: "alice", author_type: "User" as const, draft: false, fork: false };
+
+  it("returns the skip reason only for disabled repos, following layer precedence", () => {
+    const file = parsePolicy(LAYERED);
+    expect(killSwitchReason(resolvePolicy(file, "acme/web"))).toBeUndefined();
+    expect(killSwitchReason(resolvePolicy(file, "acme/off"))).toBe(KILL_SWITCH_REASON);
+    expect(killSwitchReason(resolvePolicy(file, "ACME/OFF"))).toBe(KILL_SWITCH_REASON);
+    const f = parsePolicy("version: 1\ndefaults: { enabled: false }\nrepos:\n  o/on: { enabled: true }\n");
+    expect(killSwitchReason(resolvePolicy(f, "o/x"))).toBe(KILL_SWITCH_REASON);
+    expect(killSwitchReason(resolvePolicy(f, "o/on"))).toBeUndefined();
+    expect(killSwitchReason(resolvePolicy(parsePolicy("version: 1\n"), "o/x"))).toBeUndefined();
+  });
+
+  it("fails closed when enabled is not exactly true", () => {
+    expect(killSwitchReason({ enabled: undefined as unknown as boolean })).toBe(KILL_SWITCH_REASON);
+    expect(killSwitchReason({ enabled: "false" as unknown as boolean })).toBe(KILL_SWITCH_REASON);
+  });
+
+  // Regression (publisher-ignores-kill-switch): the publisher re-resolves the LIVE manifest at
+  // publish time (--policy fallback, self-hosted mode), so a flip after prepare must be visible on
+  // the policy it acts on, and survive the resolved-policy JSON round trip (hosted mode / ctx).
+  it("sees a mid-run flip of the live manifest and survives the resolved-policy round trip", () => {
+    const manifest = join(dir, "killswitch.yaml");
+    const body = (enabled: boolean): string =>
+      ["version: 1", "defaults:", `  enabled: ${enabled}`, "  capabilities:", "    approve: { enabled: true }", "    block: { enabled: true }"].join("\n");
+    writeFileSync(manifest, body(true));
+    const atPrepare = resolvePolicy(loadPolicy(manifest), "acme/web");
+    expect(killSwitchReason(atPrepare)).toBeUndefined();
+    expect(shouldSkip(atPrepare, PR).skip).toBe(false);
+
+    writeFileSync(manifest, body(false)); // devops flips the switch while the agent runs
+    const atPublish = resolvePolicy(loadPolicy(manifest), "acme/web");
+    expect(atPublish.capabilities.approve.enabled).toBe(true); // capabilities alone do not stop it
+    expect(killSwitchReason(atPublish)).toBe(KILL_SWITCH_REASON);
+
+    const resolved = join(dir, "killswitch.resolved.json");
+    writeFileSync(resolved, JSON.stringify(atPublish));
+    expect(killSwitchReason(readResolvedPolicy(resolved))).toBe(KILL_SWITCH_REASON);
+  });
+
+  it("uses the same reason as prepare's skip rule, so every stage reports the same outcome reason", () => {
+    const off = resolvePolicy(parsePolicy("version: 1\ndefaults: { enabled: false }\n"), "acme/web");
+    expect(shouldSkip(off, PR)).toEqual({ skip: true, reason: KILL_SWITCH_REASON });
+  });
+});
+
+/* ------------------------- repository pattern grammar ------------------------- */
+
+// Regression (cross-repo-deny-unsupported-pattern, repo-patterns-unvalidated-deny-fails-open):
+// repoPatternMatch only understands owner/name, owner/* and *, but the schema accepted any string,
+// so a deny entry such as "acme/legacy-*" silently matched nothing (fail open) and
+// `xrepo policy validate` still said ok.
+const UNSUPPORTED_PATTERNS = [
+  "acme/legacy-*",
+  "acme/*-vault",
+  "*/secrets",
+  "acme/sec*",
+  "acme/**",
+  "Acme/Vault/",
+  "https://github.com/acme/hush",
+  "acme",
+  "acme/api/extra",
+  "-acme/api",
+  ".hidden/x",
+  "acme/.git",
+  "acme/..",
+  "acme/*x",
+  "**",
+  "",
+];
+
+describe("repository pattern grammar", () => {
+  it("repoPatternKind accepts exactly owner/name, owner/* and *", () => {
+    expect(repoPatternKind("*")).toBe("all");
+    expect(repoPatternKind("acme/*")).toBe("owner");
+    expect(repoPatternKind("OTHER/*")).toBe("owner");
+    for (const ok of ["acme/api", "Acme/Web", "acme/.github", "a-b/c_d.e", "acme/x-"]) {
+      expect(repoPatternKind(ok), ok).toBe("exact");
+      expect(isExactRepoName(ok), ok).toBe(true);
+    }
+    for (const bad of [...UNSUPPORTED_PATTERNS, "acme/-x", "_acme/x", " acme/api ", "acme/api ", `acme/${"x".repeat(101)}`]) {
+      expect(repoPatternKind(bad), bad).toBeUndefined();
+    }
+    expect(isExactRepoName("acme/*")).toBe(false);
+    expect(isExactRepoName("*")).toBe(false);
+  });
+
+  it("exact names follow the same rule as xrepo sync (isValidRepoName), so the grammar cannot diverge", async () => {
+    const { isValidRepoName } = await import("../src/sync/sync.js");
+    const names = [
+      ...UNSUPPORTED_PATTERNS,
+      "acme/api", "Acme/Web", "acme/.github", "acme/.GIT", "acme/-x", "_acme/x", "a/b", "a.b/c", "acme/x-", "acme/a b",
+      `${"o".repeat(100)}/${"r".repeat(100)}`, `${"o".repeat(101)}/r`, `o/${"r".repeat(101)}`, "acme/api$", "acme/./x",
+    ];
+    for (const n of names) expect(isExactRepoName(n), n).toBe(isValidRepoName(n));
+  });
+
+  it("repoPatternProblem names the pattern and the supported forms; mirror.repos forms exclude '*'", () => {
+    expect(repoPatternProblem("acme/api")).toBeUndefined();
+    expect(repoPatternProblem("*")).toBeUndefined();
+    expect(repoPatternProblem("acme/legacy-*")).toBe(
+      '"acme/legacy-*" is not a supported repository pattern (expected owner/name, owner/* or *; other globs are not supported, list repositories by name)',
+    );
+    expect(repoPatternProblem("Acme/Vault/")).toBe('"Acme/Vault/" is not a supported repository pattern (expected owner/name, owner/* or *)');
+    expect(repoPatternProblem("*", { allowAll: false })).toContain("(expected owner/name or owner/*)");
+    expect(repoPatternProblem("acme/*", { allowAll: false })).toBeUndefined();
+  });
+
+  it("repoPatternCovers", () => {
+    expect(repoPatternCovers("*", "acme/api")).toBe(true);
+    expect(repoPatternCovers("*", "*")).toBe(true);
+    expect(repoPatternCovers("acme/*", "ACME/api")).toBe(true);
+    expect(repoPatternCovers("acme/*", "acme/*")).toBe(true);
+    expect(repoPatternCovers("acme/*", "*")).toBe(false);
+    expect(repoPatternCovers("acme/*", "other/api")).toBe(false);
+    expect(repoPatternCovers("acme/api", "Acme/API")).toBe(true);
+    expect(repoPatternCovers("acme/api", "acme/*")).toBe(false);
+    expect(repoPatternCovers("acme/legacy-*", "acme/legacy-billing")).toBe(false);
+    expect(repoPatternCovers("*", "acme/legacy-*")).toBe(false);
+  });
+
+  it("parsePolicy rejects unsupported cross_repo.readable / deny and mirror.exclude patterns, naming each", () => {
+    for (const bad of UNSUPPORTED_PATTERNS) {
+      for (const [where, yaml] of [
+        ["defaults.cross_repo.deny[1]", `defaults:\n  cross_repo: { deny: ["acme/ok", ${JSON.stringify(bad)}] }\n`],
+        ["defaults.cross_repo.readable[0]", `defaults:\n  cross_repo: { readable: [${JSON.stringify(bad)}] }\n`],
+        ['repos["acme/web"].cross_repo.deny[0]', `repos:\n  acme/web:\n    cross_repo: { deny: [${JSON.stringify(bad)}] }\n`],
+        ["mirror.exclude[0]", `mirror:\n  repos: ["acme/*"]\n  exclude: [${JSON.stringify(bad)}]\n`],
+      ] as const) {
+        const msg = errorOf(() => parsePolicy(`version: 1\n${yaml}`)).message;
+        expect(msg, `${where} ${bad}`).toContain(`${where}: ${JSON.stringify(bad)} is not a supported repository pattern`);
+      }
+    }
+  });
+
+  it("parsePolicy accepts every supported form (case-insensitive, surrounding whitespace ignored as in matching)", () => {
+    const f = parsePolicy(
+      'version: 1\ndefaults:\n  cross_repo: { readable: ["*", "acme/*", "Acme/Web", " acme/api "], deny: ["acme/.github", "OTHER/*", "*"] }\n' +
+        'mirror:\n  repos: ["acme/*"]\n  exclude: ["acme/secrets-vault", "legacy/*", "*"]\n',
+    );
+    expect(f.defaults.cross_repo?.readable).toEqual(["*", "acme/*", "Acme/Web", " acme/api "]);
+    expect(f.mirror.exclude).toEqual(["acme/secrets-vault", "legacy/*", "*"]);
+  });
+
+  it("the reported misconfiguration no longer loads; the supported spelling denies as intended", () => {
+    const repro = (deny: string) =>
+      `version: 1\ndefaults:\n  cross_repo: { readable: ["acme/*"], deny: ["acme/secrets-vault"] }\n` +
+      `repos:\n  acme/web:\n    cross_repo: { deny: [${deny}] }\n`;
+    const msg = errorOf(() => parsePolicy(repro('"acme/legacy-*"'))).message;
+    expect(msg).toContain('repos["acme/web"].cross_repo.deny[0]: "acme/legacy-*" is not a supported repository pattern');
+
+    const f = parsePolicy(repro('"acme/secrets-vault", "acme/legacy-billing"'));
+    const mirror = ["acme/secrets-vault", "acme/legacy-billing", "acme/api"];
+    expect(readableRepos(resolvePolicy(f, "acme/web"), mirror)).toEqual(["acme/api"]);
+    expect(readableRepos(resolvePolicy(f, "acme/api"), mirror)).toEqual(["acme/api", "acme/legacy-billing"]);
+  });
+
+  it("loadPolicy and `xrepo policy validate` fail on an unsupported deny pattern instead of saying ok", async () => {
+    const p = join(dir, "bad-deny.yaml");
+    writeFileSync(p, 'version: 1\ndefaults:\n  cross_repo: { readable: ["acme/*"], deny: ["acme/secrets-*", "*/secrets"] }\n');
+    const msg = errorOf(() => loadPolicy(p)).message;
+    expect(msg).toContain(p);
+    expect(msg).toContain('defaults.cross_repo.deny[0]: "acme/secrets-*" is not a supported repository pattern');
+    expect(msg).toContain('defaults.cross_repo.deny[1]: "*/secrets" is not a supported repository pattern');
+
+    const { policyMain } = await import("../src/cli.js");
+    let out = "";
+    let err = "";
+    const code = await policyMain(["validate", p], {
+      stdout: { write: (s: string) => ((out += s), true) },
+      stderr: { write: (s: string) => ((err += s), true) },
+    } as never);
+    expect(code).toBe(1);
+    expect(out).toBe("");
+    expect(err).toContain('"acme/secrets-*" is not a supported repository pattern');
+  });
+
+  it("readResolvedPolicy rejects a resolved policy carrying an unsupported deny pattern", () => {
+    const r = resolvePolicy(parsePolicy(LAYERED), "acme/web");
+    const p = join(dir, "bad-deny.resolved.json");
+    writeFileSync(p, JSON.stringify({ ...r, cross_repo: { ...r.cross_repo, deny: ["acme/pay*"] } }));
+    expect(errorOf(() => readResolvedPolicy(p)).message).toContain('cross_repo.deny[0]: "acme/pay*" is not a supported repository pattern');
+  });
+
+  it("readableRepos fails closed when a (hand-built) policy carries an unsupported deny pattern", () => {
+    const r = resolvePolicy(parsePolicy(LAYERED), "acme/web");
+    const mirror = ["acme/web", "acme/api", "acme/payroll", "acme/legacy-billing"];
+    const handBuilt = (deny: string[]): ResolvedPolicy => ({ ...r, cross_repo: { ...r.cross_repo, deny } });
+    expect(readableRepos(handBuilt(["acme/legacy-*"]), mirror)).toEqual([]);
+    expect(readableRepos(handBuilt(["acme/payroll", "Acme/Vault/"]), mirror)).toEqual([]);
+    expect(readableRepos(handBuilt([" acme/payroll "]), mirror)).toEqual(["acme/api", "acme/legacy-billing", "acme/web"]);
+    // An unsupported readable pattern matches nothing (fails closed on its own).
+    const onlyBadReadable: ResolvedPolicy = { ...r, cross_repo: { ...r.cross_repo, readable: ["acme/leg*"], deny: [] } };
+    expect(readableRepos(onlyBadReadable, mirror)).toEqual(["acme/web"]);
+  });
+});
+
+describe("policyFileWarnings", () => {
+  it("reports mirror.repos entries xrepo sync rejects, while the policy still loads (sync fails them per entry)", () => {
+    const f = parsePolicy(
+      'version: 1\nmirror:\n  repos: ["acme/api", "acme/*", "acme", "acme/api/extra", "-acme/api", "acme/*x", "*", "acme/.git", ".hidden/x"]\n',
+    );
+    const w = policyFileWarnings(f);
+    expect(w).toEqual(
+      ["acme", "acme/api/extra", "-acme/api", "acme/*x", "*", "acme/.git", ".hidden/x"].map(
+        (e, i) => `mirror.repos[${i + 2}]: ${repoPatternProblem(e, { allowAll: false })}; xrepo sync fails this entry on every run`,
+      ),
+    );
+    expect(w[4]).toContain('"*" is not a supported repository pattern (expected owner/name or owner/*)');
+  });
+
+  it("warns when a repo layer's cross_repo.deny drops a defaults deny entry that is still readable there", () => {
+    const f = parsePolicy(
+      [
+        "version: 1",
+        "defaults:",
+        '  cross_repo: { readable: ["acme/*"], deny: ["acme/secrets-vault", "acme/payroll", "other/*"] }',
+        "repos:",
+        "  acme/web:",
+        '    cross_repo: { deny: ["acme/legacy-billing"] }', // drops both acme entries; other/* is not readable here
+        "  acme/api:",
+        '    cross_repo: { deny: ["acme/*"] }', // covers every inherited acme entry
+        "  acme/docs:",
+        '    cross_repo: { readable: ["acme/handbook"], deny: [] }', // nothing inherited is readable any more
+        "  acme/ops:",
+        '    cross_repo: { readable: ["*"], deny: ["acme/payroll"] }', // drops acme/secrets-vault and other/*
+        "  acme/mobile:",
+        "    cross_repo: { readable: [\"acme/*\"] }", // does not set deny: inherits the defaults list
+        "",
+      ].join("\n"),
+    );
+    const w = policyFileWarnings(f);
+    const drop = (repo: string, entry: string) =>
+      `repos.${repo}: cross_repo.deny replaces the defaults list, so "${entry}" (denied in defaults) is not denied for this repository; ` +
+      `add it to repos.${repo}.cross_repo.deny to keep it denied`;
+    expect(w).toEqual([
+      drop("acme/web", "acme/secrets-vault"),
+      drop("acme/web", "acme/payroll"),
+      drop("acme/ops", "acme/secrets-vault"),
+      drop("acme/ops", "other/*"),
+    ]);
+    // The warning is accurate: those repositories really are readable there.
+    const mirror = ["acme/secrets-vault", "acme/payroll", "other/lib", "acme/api"];
+    expect(readableRepos(resolvePolicy(f, "acme/web"), mirror)).toEqual(["acme/api", "acme/payroll", "acme/secrets-vault"]);
+    expect(readableRepos(resolvePolicy(f, "acme/mobile"), mirror)).toEqual(["acme/api"]);
+  });
+
+  it("a dropped deny entry naming the PR repository itself is reported (its own mirror is always readable)", () => {
+    const f = parsePolicy(
+      'version: 1\ndefaults:\n  cross_repo: { deny: ["acme/web"] }\nrepos:\n  acme/web:\n    cross_repo: { deny: ["acme/other"] }\n',
+    );
+    expect(policyFileWarnings(f)).toEqual([
+      'repos.acme/web: cross_repo.deny replaces the defaults list, so "acme/web" (denied in defaults) is not denied for this repository; add it to repos.acme/web.cross_repo.deny to keep it denied',
+    ]);
+  });
+
+  it("the shipped example policy and the layered fixture have no file-level warnings", () => {
+    expect(policyFileWarnings(loadPolicy(join(import.meta.dirname, "..", "examples", "policy.yaml")))).toEqual([]);
+    expect(policyFileWarnings(parsePolicy(LAYERED))).toEqual([]);
+  });
+});
+
+describe("`xrepo policy validate` prints the file-level warnings", () => {
+  it("names bad mirror.repos entries and a dropped defaults deny on stderr, and still exits 0", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "xrepo-validate-"));
+    try {
+      const p = join(dir, "warn.yaml");
+      writeFileSync(
+        p,
+        'version: 1\ndefaults:\n  cross_repo: { readable: ["acme/*"], deny: ["acme/vault"] }\nrepos:\n  acme/web:\n    cross_repo: { deny: ["acme/other"] }\nmirror:\n  repos: ["acme/api", "acme"]\n',
+      );
+      const { policyMain } = await import("../src/cli.js");
+      let out = "";
+      let err = "";
+      const code = await policyMain(["validate", p], {
+        stdout: { write: (s: string) => ((out += s), true) },
+        stderr: { write: (s: string) => ((err += s), true) },
+      });
+      expect(code).toBe(0);
+      expect(out).toContain("is valid");
+      const lines = err.split("\n").filter((l) => l.startsWith("warning: ") && !/^warning: (defaults|acme\/web): /.test(l));
+      expect(lines).toHaveLength(2);
+      expect(lines[0]).toMatch(/^warning: mirror\.repos\[1\]: .*xrepo sync fails this entry on every run$/);
+      expect(lines[1]).toContain('warning: repos.acme/web: cross_repo.deny replaces the defaults list, so "acme/vault"');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

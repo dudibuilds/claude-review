@@ -3,7 +3,9 @@
  *
  * Every accepted tool call appends exactly one JSON line (src/common/draft.ts) to the draft file.
  * A separate deterministic publisher re-validates the draft against the policy and posts it; the
- * checks here mirror the publisher so the agent gets immediate, actionable feedback.
+ * checks here mirror the publisher so the agent gets immediate, actionable feedback. The verdict
+ * rules, the comment framing/size rule, the summary budget and the one-entry-per-path view of the
+ * changed files come from ./rules.ts (shared with prepare and the publisher), not from a copy here.
  *
  * Security properties:
  * - Only capabilities enabled by the resolved policy are registered, so the agent never sees the
@@ -30,10 +32,25 @@ import { audit } from "../common/audit.js";
 import { CTX_FILES, readContext, type PrContext } from "../common/context.js";
 import { isCommentable, parseUnifiedDiff, type FileDiff } from "../common/diff.js";
 import { DraftEntry, MAX_BODY_CHARS, parseDraft, type DraftComment, type DraftVerdict } from "../common/draft.js";
+import { ALWAYS_LOAD_META } from "../common/mcp.js";
 import { redactSecrets } from "../common/redact.js";
-import { compileGlobs } from "../policy/glob.js";
+// The publisher's own (path, line, whitespace-insensitive body) dedupe key, so "Duplicate" here means
+// exactly what the publisher would drop; and its sticky comment budget (for summaryBudget).
+import { commentKey, stickySummaryLimit } from "../publish/plan.js";
+import { sanitizeMarkdownEx } from "../publish/sanitize.js";
 import { readResolvedPolicy } from "../policy/load.js";
 import { Severity, severityRank, type ResolvedPolicy } from "../policy/schema.js";
+import {
+  approveBlockers,
+  changeFacts,
+  commentFrame,
+  inlineCommentsEnabled,
+  mergeSamePathDiffs,
+  mergeSamePathFiles,
+  requestChangesBlockers,
+  summaryBudget,
+  type VerdictBlocker,
+} from "./rules.js";
 
 export const REVIEW_SERVER_NAME = "xreview";
 const VERSION = "0.1.0";
@@ -45,37 +62,33 @@ const MAX_SUMMARY_WRITES = 20;
 const MAX_VERDICT_WRITES = 20;
 const MAX_LABEL_WRITES = 20;
 const MAX_LABELS_PER_CALL = 20;
-/** Characters the publisher adds around a suggestion: "\n\n```suggestion\n" + "\n```". */
-const SUGGESTION_OVERHEAD = 20;
 const MAX_LISTED_RANGES = 40;
 const MAX_LISTED_FILES = 15;
 
 const FINISHED_MSG = "The review is already finished (finish was called); no further changes are accepted.";
 
-const SEVERITY_RUBRIC =
-  "Severity: critical = exploitable vulnerability, data loss/corruption, outage, or a definite break of " +
-  "another repo's contract in production; high = definite bug on a realistic path, missing auth/validation, " +
-  "breaking API change for a known consumer; medium = bug in edge cases, missing error handling, race, " +
-  "real performance problem; low = minor bug risk, maintainability, misleading names/docs, missing test for " +
-  "risky logic; info = question or observation, not a defect.";
+/*
+ * The severity rubric is defined once, in the agent prompt ("What to report", src/prepare), and is
+ * deliberately not repeated in add_comment's description: two differently worded rubrics in one
+ * context contradicted each other (e.g. "maintainability" vs "no style/naming comments").
+ */
 
 /* ------------------------------ capabilities ----------------------------- */
-
-function commentsEnabled(policy: ResolvedPolicy): boolean {
-  const ic = policy.capabilities.inline_comments;
-  return ic.enabled && ic.max_comments > 0;
-}
 
 function allowedLabels(policy: ResolvedPolicy): string[] {
   const labels = policy.capabilities.labels;
   return labels.enabled ? [...new Set(labels.allowed)] : [];
 }
 
-/** Verdicts the agent may choose: always "comment", plus approve / request_changes when enabled. */
+/**
+ * Verdicts the agent may choose: always "comment", plus approve / request_changes when enabled.
+ * request_changes also needs inline comments: findings only come from add_comment, so without it the
+ * publisher can never block (requestChangesBlockers) and the verdict is not offered at all.
+ */
 export function allowedVerdicts(policy: ResolvedPolicy): Verdict[] {
   const out: Verdict[] = ["comment"];
   if (policy.capabilities.approve.enabled) out.push("approve");
-  if (policy.capabilities.block.enabled) out.push("request_changes");
+  if (policy.capabilities.block.enabled && inlineCommentsEnabled(policy)) out.push("request_changes");
   return out;
 }
 
@@ -85,7 +98,7 @@ export function allowedVerdicts(policy: ResolvedPolicy): Verdict[] {
  */
 export function reviewToolNames(policy: ResolvedPolicy): string[] {
   const names: string[] = [];
-  if (commentsEnabled(policy)) names.push("add_comment");
+  if (inlineCommentsEnabled(policy)) names.push("add_comment");
   if (policy.capabilities.summary_comment.enabled) names.push("set_summary");
   names.push("set_verdict");
   if (allowedLabels(policy).length > 0) names.push("add_labels");
@@ -102,10 +115,6 @@ function sha256(s: string): string {
   return createHash("sha256").update(s, "utf8").digest("hex");
 }
 
-/** Duplicate key, matching the publisher's (path, line, body hash) dedupe; whitespace-insensitive. */
-function commentKey(path: string, line: number, body: string): string {
-  return `${path}\n${line}\n${sha256(body.replace(/\s+/g, " ").trim())}`;
-}
 
 function lineRange(line: number, end?: number): string {
   return end !== undefined && end !== line ? `${line}-${end}` : `${line}`;
@@ -141,7 +150,7 @@ function rightRanges(fd: FileDiff): Array<[number, number]> {
 function formatRanges(fd: FileDiff): string {
   const ranges = rightRanges(fd);
   const shown = ranges.slice(0, MAX_LISTED_RANGES).map(([a, b]) => (a === b ? `${a}` : `${a}-${b}`));
-  const more = ranges.length > MAX_LISTED_RANGES ? ` (+${ranges.length - MAX_LISTED_RANGES} more; see pr_diff)` : "";
+  const more = ranges.length > MAX_LISTED_RANGES ? ` (+${ranges.length - MAX_LISTED_RANGES} more; see PrDiff)` : "";
   return `${shown.join(", ")}${more}`;
 }
 
@@ -153,7 +162,7 @@ function secretProblem(field: string, text: string | undefined): string | null {
   const kinds = [...new Set([...r.text.matchAll(/\[REDACTED:([^\]\s]{1,40})\]/g)].map((m) => m[1]))];
   return (
     `${field} appears to contain a secret or credential (${kinds.join(", ") || "secret"}). Never quote ` +
-    `secrets in a review: say where it is instead (e.g. "hard-coded API key at owner/repo:path:line") and ` +
+    `secrets in a review: say where it is instead (e.g. "hard-coded API key at /repos/<owner>/<name>/<path>:<line>") and ` +
     `recommend rotating it.`
   );
 }
@@ -296,11 +305,18 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
   const verdicts = allowedVerdicts(policy);
   const labelsAllowed = allowedLabels(policy);
 
-  const files = new Map(ctx.files.map((f) => [f.path, f] as const));
+  // One entry per path, the file as it is at head: git splits a type change (symlink <-> file) into
+  // a deletion and an addition of the same path, and both halves reach ctx.files and the diff.
+  const fileList = mergeSamePathFiles(ctx.files);
+  const files = new Map(fileList.map((f) => [f.path, f] as const));
   const ignored = new Set(ctx.ignored_files);
-  const diffs = new Map<string, FileDiff>();
-  for (const fd of opts.diff) if (!diffs.has(fd.path)) diffs.set(fd.path, fd);
-  const changedPaths = [...new Set([...ctx.files.map((f) => f.path), ...ctx.ignored_files])];
+  const diffs = new Map(mergeSamePathDiffs(opts.diff).map((fd) => [fd.path, fd] as const));
+  // Touched paths (renamed-from and ignored files included) and changed lines (ignored files
+  // included), exactly as the publisher's verdict rules see them.
+  const facts = changeFacts(ctx, opts.diff);
+  // What summary_comment.max_chars allows the agent's text, as the publisher lays the summary out
+  // (its title and footers are extra); max_chars unless the sticky / review body cap leaves less.
+  const summaryChars = summaryBudget(policy, stickySummaryLimit(policy)).bodyChars;
 
   const state = loadState(outFile);
 
@@ -364,6 +380,16 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
     }
   };
 
+  /** Length of `text` as the publisher posts it (sanitized for GitHub, never cut). */
+  const postedLength = (text: string, allowSuggestions: boolean): number =>
+    sanitizeMarkdownEx(text, {
+      allowMentions: policy.output.allow_mentions,
+      allowImages: policy.output.allow_images,
+      linkAllowlist: policy.output.link_allowlist,
+      maxChars: Number.MAX_SAFE_INTEGER,
+      allowSuggestions,
+    }).text.length;
+
   /* ---- path / line validation ---- */
 
   const guessPath = (input: string): string | undefined => {
@@ -380,26 +406,26 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
     }
     if (s !== input && files.has(s)) return s;
     const lower = s.toLowerCase();
-    const ci = ctx.files.filter((f) => f.path.toLowerCase() === lower);
+    const ci = fileList.filter((f) => f.path.toLowerCase() === lower);
     if (ci.length === 1) return ci[0]!.path;
     const base = basename(s);
-    const sameBase = base === "" ? [] : ctx.files.filter((f) => basename(f.path) === base);
+    const sameBase = base === "" ? [] : fileList.filter((f) => basename(f.path) === base);
     if (sameBase.length === 1) return sameBase[0]!.path;
     return undefined;
   };
 
   const unknownPathMessage = (input: string): string => {
-    const renamed = ctx.files.find((f) => f.previous_path !== undefined && f.previous_path === input);
+    const renamed = fileList.find((f) => f.previous_path !== undefined && f.previous_path === input);
     if (renamed) return `"${input}" was renamed to "${renamed.path}" in this PR; comment on the new path.`;
     const guess = guessPath(input);
     if (guess !== undefined) {
-      return `"${input}" is not a changed file in this PR. Did you mean "${guess}"? Use the repo-relative path exactly as pr_overview lists it.`;
+      return `"${input}" is not a changed file in this PR. Did you mean "${guess}"? Use the path exactly as PrDiff lists it (e.g. /pr/src/orders.ts or src/orders.ts).`;
     }
-    const listed = ctx.files.slice(0, MAX_LISTED_FILES).map((f) => f.path);
-    const more = ctx.files.length > MAX_LISTED_FILES ? ` (+${ctx.files.length - MAX_LISTED_FILES} more; see pr_overview)` : "";
+    const listed = fileList.slice(0, MAX_LISTED_FILES).map((f) => f.path);
+    const more = fileList.length > MAX_LISTED_FILES ? ` (+${fileList.length - MAX_LISTED_FILES} more; see PrDiff)` : "";
     return (
       `"${input}" is not a changed file in this PR. Inline comments are only possible on the PR's changed ` +
-      `files; cite other repos or unchanged files as owner/repo:path:line inside a comment or the summary. ` +
+      `files; cite other repos or unchanged files as /repos/<owner>/<name>/<path>:<line> (or /pr/<path>:<line>) inside a comment or the summary. ` +
       `Changed files: ${listed.join(", ") || "(none)"}${more}.`
     );
   };
@@ -427,34 +453,39 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
 
   /* ---- verdict heads-up (the publisher decides; these are non-binding notes) ---- */
 
-  const neverApprove = compileGlobs(caps.approve.never_paths);
+  /** Rules (shared with the publisher) that would downgrade `verdict` given what is recorded now. */
+  const verdictBlockers = (verdict: Verdict): VerdictBlocker[] => {
+    if (verdict === "approve") return approveBlockers(policy, facts, state.comments);
+    if (verdict === "request_changes") return requestChangesBlockers(policy, state.comments);
+    return [];
+  };
+  const reasons = (blockers: VerdictBlocker[]): string => blockers.map((b) => b.message).join("; ");
+  /**
+   * Same, without PR-controlled text: for tool descriptions, which the model may treat as trusted
+   * instructions (file names are chosen by the PR author; tool results may carry them, as PrDiff does).
+   */
+  const ruleReasons = (blockers: VerdictBlocker[]): string =>
+    blockers
+      .map((b) => (b.rule === "never_paths" ? `${b.paths?.length ?? 0} changed path(s) match approve.never_paths` : b.message))
+      .join("; ");
+
   const verdictNotes = (verdict: Verdict): string[] => {
-    const notes: string[] = [];
+    const blockers = verdictBlockers(verdict);
+    if (blockers.length === 0) return [];
     if (verdict === "approve") {
-      const maxAllowed = caps.approve.max_severity_allowed;
-      const above = state.comments.filter((c) => severityRank(c.severity) > severityRank(maxAllowed));
-      if (above.length > 0) {
-        notes.push(`${above.length} recorded finding(s) are above "${maxAllowed}"; the publisher will downgrade the approval to comment.`);
-      }
-      const never = changedPaths.filter((p) => neverApprove(p));
-      if (never.length > 0) {
-        const list = never.slice(0, 5).join(", ") + (never.length > 5 ? ` (+${never.length - 5} more)` : "");
-        notes.push(`This PR changes ${list}, which this policy never auto-approves; the verdict will be published as comment.`);
-      }
-      if (ctx.changed_lines > caps.approve.max_changed_lines) {
-        notes.push(
-          `This PR changes ${ctx.changed_lines} lines; approval is limited to ${caps.approve.max_changed_lines}, so it will be published as comment.`,
-        );
-      }
-    } else if (verdict === "request_changes") {
-      const min = caps.block.min_severity;
-      if (!state.comments.some((c) => severityRank(c.severity) >= severityRank(min))) {
-        notes.push(
-          `No recorded inline finding has severity >= "${min}" yet. request_changes is only published with at least one such finding; otherwise it is downgraded to comment.`,
-        );
-      }
+      return [
+        `The publisher will downgrade this approval to comment: ${reasons(blockers)}. ` +
+          "Set the verdict to comment instead, and do not describe the PR as approved in the summary.",
+      ];
     }
-    return notes;
+    const onlyMissingFinding = blockers.every((b) => b.rule === "findings");
+    return [
+      `The publisher will downgrade this request for changes to comment: ${reasons(blockers)}` +
+        (onlyMissingFinding
+          ? ` among the recorded inline comments. It applies once an inline comment with severity >= "${caps.block.min_severity}" ` +
+            "is recorded; record a finding only if it is real, and never raise a severity to qualify."
+          : "."),
+    ];
   };
 
   /* ---- status ---- */
@@ -462,7 +493,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
   const statusText = (): string => {
     const out: string[] = [];
     out.push(`Review draft for ${ctx.repo}#${ctx.number}${state.finished ? " (FINISHED: no further changes accepted)" : ""}`);
-    if (commentsEnabled(policy)) {
+    if (inlineCommentsEnabled(policy)) {
       const left = Math.max(0, ic.max_comments - state.comments.length);
       out.push(
         `Inline comments: ${state.comments.length} recorded, ${left} of ${ic.max_comments} left ` +
@@ -477,8 +508,8 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
     if (sc.enabled) {
       out.push(
         state.summary !== undefined
-          ? `Summary: set (${state.summary.length} of max ${sc.max_chars} chars)`
-          : `Summary: not set (max ${sc.max_chars} chars)`,
+          ? `Summary: set (${state.summary.trim().length} of max ${summaryChars} chars)`
+          : `Summary: not set (max ${summaryChars} chars)`,
       );
     } else {
       out.push("Summary: disabled by policy");
@@ -490,12 +521,19 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
       out.push(`Labels: ${state.labels.join(", ") || "none"}; allowed: ${labelsAllowed.join(", ")}`);
     }
     if (caps.approve.enabled) {
+      const lines = `${facts.changedLines}${facts.changedLines > ctx.changed_lines ? ", files excluded from the review included" : ""}`;
       out.push(
         `Approve rule: no finding above "${caps.approve.max_severity_allowed}", no changed file matching ` +
-          `${caps.approve.never_paths.join(", ") || "(none)"}, <= ${caps.approve.max_changed_lines} changed lines (this PR: ${ctx.changed_lines})`,
+          `${caps.approve.never_paths.join(", ") || "(none)"}, <= ${caps.approve.max_changed_lines} changed lines (this PR: ${lines})`,
       );
+      const now = verdictBlockers("approve");
+      if (now.length > 0) out.push(`  approve now: would be published as comment (${reasons(now)})`);
     }
-    if (caps.block.enabled) out.push(`Request-changes rule: at least one finding with severity >= "${caps.block.min_severity}"`);
+    if (caps.block.enabled) {
+      out.push(`Request-changes rule: at least one finding with severity >= "${caps.block.min_severity}"`);
+      const now = verdictBlockers("request_changes");
+      if (now.length > 0) out.push(`  request_changes now: would be published as comment (${reasons(now)})`);
+    }
     out.push(`Finished: ${state.finished ? "yes" : "no (call finish last)"}`);
     out.push(`Tools: ${toolNames.join(", ")}`);
     return out.join("\n");
@@ -504,13 +542,13 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
   const writeAnnotations = { readOnlyHint: false, destructiveHint: false, openWorldHint: false } as const;
 
   /* ---- add_comment ---- */
-  if (commentsEnabled(policy)) {
+  if (inlineCommentsEnabled(policy)) {
     const shape: z.ZodRawShape = {
       path: z
         .string()
         .min(1)
         .max(1024)
-        .describe("Repo-relative path of a changed file, exactly as pr_overview lists it (e.g. src/api/orders.ts)."),
+        .describe("A changed file as PrDiff lists it: /pr/<path> (e.g. /pr/src/api/orders.ts) or the repo-relative path (src/api/orders.ts)."),
       line: z.number().int().min(1).describe("Line number in the NEW version of the file (RIGHT side); first line of a range."),
       end_line: z
         .number()
@@ -521,8 +559,8 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
       body: z
         .string()
         .min(1)
-        .describe(`Markdown: the issue, why it matters, how to fix. Max ${ic.max_comment_chars} chars${ic.suggestions ? " including the suggestion" : ""}.`),
-      severity: Severity.describe("critical | high | medium | low | info (see the rubric in the tool description)."),
+        .describe(`Markdown: the issue, why it matters, how to fix. Max ${ic.max_comment_chars} chars${ic.suggestions ? " for body and suggestion together" : ""}.`),
+      severity: Severity.describe('critical | high | medium | low | info, as defined under "What to report" in your instructions.'),
       category: z
         .string()
         .max(60)
@@ -543,15 +581,16 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
       {
         title: "Add inline review comment",
         description:
-          "Add an inline comment on a changed line of the PR (new/RIGHT side; only lines inside diff hunks, see pr_diff). " +
+          "Add an inline comment on a changed line of the PR (new/RIGHT side; only lines inside diff hunks, see PrDiff with file_path). " +
           "One issue per comment. Make it actionable: what is wrong, why it matters (impact), how to fix. Only report " +
-          "issues you verified; cite cross-repo evidence as owner/repo:path:line (e.g. acme/web:src/api/orders.ts:42). " +
-          "No praise, no restating the code, no style nits. " +
-          `${SEVERITY_RUBRIC} Policy: at most ${ic.max_comments} comments in total (spend them on the most important ` +
-          `issues), severity >= ${ic.min_severity}, max ${ic.max_comment_chars} chars.` +
+          "issues you verified; cite cross-repo evidence as /repos/<owner>/<name>/<path>:<line> (e.g. /repos/acme/web/src/api/orders.ts:42). " +
+          "No praise, no restating the code, no style nits. Severity as defined in your instructions. " +
+          `Policy: at most ${ic.max_comments} comments in total (spend them on the most important ` +
+          `issues), severity >= ${ic.min_severity}, max ${ic.max_comment_chars} chars${ic.suggestions ? " (body plus suggestion)" : ""}.` +
           (ic.suggestions ? " Optional `suggestion` = exact replacement code for the commented lines." : " Suggestion blocks are disabled."),
         inputSchema: z.object(shape).strict(),
         annotations: { ...writeAnnotations, idempotentHint: false },
+        _meta: { ...ALWAYS_LOAD_META },
       },
       (args) =>
         run("add_comment", args, () => {
@@ -563,7 +602,9 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
                 (sc.enabled ? "Put any remaining points in the summary." : "Keep only the most important points."),
             );
           }
-          const pc = checkPath(a.path);
+          // xsearch prints changed files as /pr/<path>; the draft stores the repo-relative path.
+          const path = a.path.startsWith("/pr/") ? a.path.slice(4) : a.path;
+          const pc = checkPath(path);
           if ("error" in pc) return fail(pc.error);
           let end = a.end_line;
           if (end !== undefined && end < a.line) return fail(`end_line (${end}) must be >= line (${a.line}).`);
@@ -571,7 +612,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           if (!isCommentable(pc.fd, a.line, end)) {
             const what = end === undefined ? `Line ${a.line}` : `Lines ${a.line}-${end}`;
             return fail(
-              `${what} of ${a.path} ${end === undefined ? "is" : "are"} not inside a single diff hunk on the RIGHT (new) side, ` +
+              `${what} of ${path} ${end === undefined ? "is" : "are"} not inside a single diff hunk on the RIGHT (new) side, ` +
                 `so ${end === undefined ? "it" : "they"} cannot get an inline comment. Commentable lines: ${formatRanges(pc.fd)}. ` +
                 `Pick a line inside one of these ranges (a multi-line range must stay within one), or mention the point in the summary.`,
             );
@@ -585,11 +626,17 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           const body = a.body;
           if (body.trim() === "") return fail("body must not be empty.");
           const suggestion = a.suggestion;
-          const total = body.length + (suggestion !== undefined ? suggestion.length + SUGGESTION_OVERHEAD : 0);
-          if (total > ic.max_comment_chars) {
+          const category = a.category?.trim() || undefined;
+          // The publisher's own framing (header, suggestion block, budget): see rules.ts.
+          const frame = commentFrame(ic, { body, severity: a.severity, category, suggestion });
+          if (frame.agentChars > ic.max_comment_chars) {
+            const sugg =
+              suggestion !== undefined && frame.agentChars > body.length
+                ? ` + suggestion ${suggestion.length} chars (${frame.agentChars - body.length} as a suggestion block) = ${frame.agentChars}`
+                : "";
             return fail(
-              `Comment too long: body ${body.length} chars${suggestion !== undefined ? ` + suggestion ${suggestion.length} chars` : ""} ` +
-                `exceeds this policy's limit of ${ic.max_comment_chars}. Shorten it: state the issue, impact and fix concisely.`,
+              `Comment too long: body ${body.length} chars${sugg} exceeds this policy's limit of ${ic.max_comment_chars}. ` +
+                "Shorten it: state the issue, impact and fix concisely.",
             );
           }
           if (!ic.suggestions && /(`{3,}|~{3,})\s*suggestion\b/i.test(body)) {
@@ -598,16 +645,31 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           if (suggestion !== undefined && /^\s*(`{3,}|~{3,})/.test(suggestion)) {
             return fail("Pass only the replacement code in `suggestion`, without ``` fences; it is wrapped in a suggestion block automatically.");
           }
-          const category = a.category?.trim() || undefined;
           const secret = secretProblem("body", body) ?? secretProblem("suggestion", suggestion) ?? secretProblem("category", category);
           if (secret) return fail(secret);
-          const key = commentKey(a.path, a.line, body);
+          if (frame.suggestionDropped !== undefined) {
+            return fail(
+              `The suggestion ${frame.suggestionDropped}, so the publisher would drop it. Pass only the exact replacement lines ` +
+                "(plain code, no ``` lines or control characters), or omit suggestion and describe the fix in the body.",
+            );
+          }
+          // Sanitizing for GitHub can lengthen the text (e.g. @mentions, entities and bare URLs are
+          // neutralized with zero-width spaces); the publisher cuts anything over the budget.
+          const posted = postedLength(frame.text, ic.suggestions);
+          if (posted > frame.textBudget) {
+            const over = posted - frame.textBudget;
+            return fail(
+              `Comment too long as posted: after the publisher neutralizes @mentions, links and markup for GitHub it is ${over} ` +
+                `char(s) over this policy's limit of ${ic.max_comment_chars}, so its end would be cut. Shorten the body by at least ${over} chars.`,
+            );
+          }
+          const key = commentKey(path, a.line, body);
           if (state.commentKeys.has(key)) {
-            return fail(`Duplicate: an identical comment on ${a.path}:${a.line} was already recorded.`);
+            return fail(`Duplicate: an identical comment on ${path}:${a.line} was already recorded.`);
           }
           const entry: DraftComment = {
             type: "comment",
-            path: a.path,
+            path,
             line: a.line,
             ...(end !== undefined ? { end_line: end } : {}),
             body,
@@ -621,7 +683,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           state.commentKeys.add(key);
           const left = ic.max_comments - state.comments.length;
           return ok(
-            `Recorded comment #${state.comments.length} on ${a.path}:${lineRange(a.line, end)} (${a.severity}). ` +
+            `Recorded comment #${state.comments.length} on ${path}:${lineRange(a.line, end)} (${a.severity}). ` +
               `${left} of ${ic.max_comments} inline comments left.`,
           );
         }),
@@ -637,21 +699,32 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
         description:
           `Set the overall review summary (markdown), posted as ${sc.mode === "sticky" ? "the PR's sticky review comment" : "the review body"}. ` +
           "Last call wins: always send the complete text. Structure: a 1-2 sentence assessment; key risks, most severe first; " +
-          "cross-repo impact with owner/repo:path:line evidence; points that do not fit an inline comment; what you could not verify. " +
-          `Do not repeat every inline comment. Max ${sc.max_chars} chars.`,
-        inputSchema: z.object({ body: z.string().min(1).describe(`Summary markdown, max ${sc.max_chars} chars.`) }).strict(),
+          "cross-repo impact with /repos/<owner>/<name>/<path>:<line> evidence; points that do not fit an inline comment; what you could not verify. " +
+          `Do not repeat every inline comment. Max ${summaryChars} chars.`,
+        inputSchema: z.object({ body: z.string().min(1).describe(`Summary markdown, max ${summaryChars} chars.`) }).strict(),
         annotations: { ...writeAnnotations, idempotentHint: true },
+        _meta: { ...ALWAYS_LOAD_META },
       },
       (args) =>
         run("set_summary", args, () => {
           const body = (args as { body: string }).body;
           if (state.finished) return fail(FINISHED_MSG);
-          if (body.trim() === "") return fail("body must not be empty.");
-          if (body.length > sc.max_chars) {
-            return fail(`Summary too long: ${body.length} chars; this policy allows ${sc.max_chars}. Shorten it (inline comments carry the details).`);
+          // The publisher posts the trimmed text, sanitized, within summaryChars (rules.ts summaryBudget).
+          const text = body.trim();
+          if (text === "") return fail("body must not be empty.");
+          if (text.length > summaryChars) {
+            return fail(`Summary too long: ${text.length} chars; this policy allows ${summaryChars}. Shorten it (inline comments carry the details).`);
           }
           const secret = secretProblem("body", body);
           if (secret) return fail(secret);
+          const posted = postedLength(text, false);
+          if (posted > summaryChars) {
+            const over = posted - summaryChars;
+            return fail(
+              `Summary too long as posted: after the publisher neutralizes @mentions, links and markup for GitHub it is ${over} ` +
+                `char(s) over this policy's limit of ${summaryChars}, so its end would be cut. Shorten it by at least ${over} chars.`,
+            );
+          }
           if (state.summaryWrites >= MAX_SUMMARY_WRITES) {
             return fail(`set_summary was already called ${state.summaryWrites} times; no more updates are accepted. Call finish.`);
           }
@@ -660,7 +733,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           if (err) return fail(err);
           state.summary = body;
           state.summaryWrites++;
-          return ok(`Summary ${replaced ? "replaced" : "recorded"} (${body.length} chars).`);
+          return ok(`Summary ${replaced ? "replaced" : "recorded"} (${text.length} chars).`);
         }),
     );
   }
@@ -673,9 +746,14 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
         `approve = only when you checked the change and found nothing above "${caps.approve.max_severity_allowed}". ` +
           `Never approved when the PR touches ${caps.approve.never_paths.join(", ") || "(no paths)"} or changes more than ${caps.approve.max_changed_lines} lines.`,
       );
+      // PR-specific facts that already rule approval out (the same rules the publisher applies).
+      const now = approveBlockers(policy, facts);
+      if (now.length > 0) lines.push(`For this PR approve will be published as comment (${ruleReasons(now)}), so do not choose it.`);
     }
     if (verdicts.includes("request_changes")) {
       lines.push(`request_changes = only when at least one inline comment has severity >= "${caps.block.min_severity}".`);
+      const now = requestChangesBlockers(policy);
+      if (now.length > 0) lines.push(`For this PR request_changes will be published as comment (${ruleReasons(now)}).`);
     }
     lines.push("The publisher re-checks these rules and downgrades to comment if one fails.");
     server.registerTool(
@@ -690,6 +768,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           })
           .strict(),
         annotations: { ...writeAnnotations, idempotentHint: true },
+        _meta: { ...ALWAYS_LOAD_META },
       },
       (args) =>
         run("set_verdict", args, () => {
@@ -730,6 +809,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
           })
           .strict(),
         annotations: { ...writeAnnotations, idempotentHint: true },
+        _meta: { ...ALWAYS_LOAD_META },
       },
       (args) =>
         run("add_labels", args, () => {
@@ -760,6 +840,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
         "Show what you have recorded so far (comments, remaining comment budget, summary, verdict, labels) and what this review is allowed to do. Read-only.",
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, openWorldHint: false },
+      _meta: { ...ALWAYS_LOAD_META },
     },
     (args) => run("review_status", args, () => ok(statusText())),
   );
@@ -774,6 +855,7 @@ export function createReviewServer(opts: ReviewServerOptions): McpServer {
         "No changes are accepted afterwards. Without finish the run counts as incomplete and is never published as approving or blocking.",
       inputSchema: z.object({}).strict(),
       annotations: { ...writeAnnotations, idempotentHint: true },
+      _meta: { ...ALWAYS_LOAD_META },
     },
     (args) =>
       run("finish", args, () => {
@@ -817,7 +899,7 @@ function serverInstructions(toolNames: string[]): string {
 
 /* ---------------------------------- CLI ----------------------------------- */
 
-const USAGE = "usage: xrepo review-mcp --ctx <dir> --out <draft.jsonl>";
+export const USAGE = "usage: xrepo review-mcp --ctx <dir> --out <draft.jsonl>";
 
 /**
  * `xrepo review-mcp --ctx <dir> --out <draft.jsonl>`: serves xreview over stdio until the client

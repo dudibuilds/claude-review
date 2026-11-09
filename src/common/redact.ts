@@ -108,14 +108,31 @@ const RULES: Rule[] = [
   },
 ];
 
-const PEM_BEGIN = /-----BEGIN ([A-Z0-9]{1,20} ){0,3}PRIVATE KEY(?: BLOCK)?-----/g;
-const PEM_END = "-----END ";
-const PEM_MAX_BLOCK = 64 * 1024;
+/**
+ * PEM private-key block rules, shared with src/search/text.ts (pemLineMap hides, line by line,
+ * every line this module's redactPem removes from the same text, so both must use these).
+ */
+export const PEM_BEGIN_SOURCE = "-----BEGIN (?:[A-Z0-9]{1,20} ){0,3}PRIVATE KEY(?: BLOCK)?-----";
+export const PEM_END = "-----END ";
+/** An END further than this from the BEGIN marker does not close the block. */
+export const PEM_MAX_BLOCK = 64 * 1024;
+const PEM_BEGIN = new RegExp(PEM_BEGIN_SOURCE, "g");
 /**
  * Body of an unterminated block (e.g. truncated output): base64 runs, whitespace, quotes / "+" /
  * literal "\\n" of string-concatenated keys, and RFC 1421 headers (Proc-Type: 4,ENCRYPTED).
+ * Linear: the pattern always succeeds, so the engine never backtracks into the loop.
  */
 const PEM_BODY = /(?:[\s"'`+,]|\\[nr]|[A-Za-z0-9+\/=]{16,}|(?:Proc-Type|DEK-Info|Comment):[^\r\n]{0,200})*/y;
+
+/**
+ * Where redaction of a block without an END (within PEM_MAX_BLOCK) stops: the end of what
+ * PEM_BODY consumes from `bodyStart` (just after the BEGIN marker), at most PEM_MAX_BLOCK on.
+ */
+export function pemUnterminatedStop(text: string, bodyStart: number): number {
+  PEM_BODY.lastIndex = bodyStart;
+  PEM_BODY.exec(text);
+  return Math.min(Math.max(PEM_BODY.lastIndex, bodyStart), bodyStart + PEM_MAX_BLOCK);
+}
 
 function redactPem(text: string): RedactResult {
   if (!text.includes("PRIVATE KEY")) return { text, count: 0 };
@@ -139,9 +156,7 @@ function redactPem(text: string): RedactResult {
       const close = text.indexOf("-----", endFound + PEM_END.length);
       stop = close !== -1 && close - endFound < 120 ? close + 5 : endFound + PEM_END.length;
     } else {
-      PEM_BODY.lastIndex = bodyStart;
-      PEM_BODY.exec(text);
-      stop = Math.min(PEM_BODY.lastIndex, bodyStart + PEM_MAX_BLOCK);
+      stop = pemUnterminatedStop(text, bodyStart);
     }
     out += text.slice(last, start) + tag("private_key");
     last = stop;

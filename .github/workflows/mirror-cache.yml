@@ -1,0 +1,122 @@
+# xrepo-mirror-cache: reusable workflow (on: workflow_call) that warms the hosted-mode mirror cache.
+#
+# review.yml in hosted mode restores and saves `$RUNNER_TEMP/xrepo-mirror` with actions/cache. Its
+# runs are pull_request runs, and GitHub scopes a cache entry to the ref that saved it: a run can
+# restore entries of its own ref (refs/pull/<n>/merge) and of the base / default branch, never a
+# sibling pull request's. Without an entry on the default branch the first run of every pull request
+# misses and clones every mirrored repository.
+#
+# Call this workflow from the same caller on a schedule (or a push to the default branch) with the
+# same xrepo_repo / xrepo_ref / policy_file / runner_labels as the review (examples/caller-hosted.yml).
+# It syncs the mirror and saves it under review.yml's key in the default-branch scope, where every
+# pull request run of that repository can restore it (caches are per repository, so each caller
+# repository warms its own). It needs no write permission and never sees a pull request.
+name: xrepo-mirror-cache
+
+on:
+  workflow_call:
+    inputs:
+      runner_labels:
+        description: "JSON array of runner labels; the same as the review's (the cache path must match)."
+        type: string
+        default: '["ubuntu-latest"]'
+      xrepo_repo:
+        description: "Repository holding the xrepo-review source; the same as the review's."
+        type: string
+        default: dudibuilds/claude-review
+      xrepo_ref:
+        description: "Commit SHA (40 hex) of xrepo_repo; the same as the review's (the cache key hashes its policy file)."
+        type: string
+        required: true
+      policy_file:
+        description: "Policy path inside the trusted xrepo checkout; the same as the review's."
+        type: string
+        default: .github/xrepo/policy.yaml
+    secrets:
+      XREPO_GITHUB_TOKEN:
+        description: "Token with contents:read on the mirrored repos (and xrepo_repo if private). Falls back to github.token."
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: xrepo-mirror-cache-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  warm:
+    name: warm mirror cache
+    runs-on: ${{ fromJSON(inputs.runner_labels) }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check inputs
+        env:
+          XREPO_REF: ${{ inputs.xrepo_ref }}
+          POLICY_FILE: ${{ inputs.policy_file }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$*"; exit 1; }
+          [[ "$XREPO_REF" =~ ^[0-9a-f]{40}$ ]] || fail "xrepo_ref must be a full commit SHA"
+          [[ "$POLICY_FILE" != *$'\n'* && "$POLICY_FILE" != *$'\r'* ]] || fail "paths must not contain line breaks"
+          case "$POLICY_FILE" in /*|../*|*/../*|*/..|..) fail "policy_file must be a relative path inside the xrepo checkout";; esac
+
+      # Same paths as review.yml in hosted mode: actions/cache keys an entry by key AND path.
+      - name: Resolve paths
+        id: paths
+        env:
+          POLICY_FILE: ${{ inputs.policy_file }}
+        run: |
+          set -euo pipefail
+          {
+            echo "policy=$GITHUB_WORKSPACE/.xrepo-src/$POLICY_FILE"
+            echo "mirror=$RUNNER_TEMP/xrepo-mirror"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Check out xrepo-review (trusted, pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ inputs.xrepo_repo }}
+          ref: ${{ inputs.xrepo_ref }}
+          path: .xrepo-src
+          token: ${{ secrets.XREPO_GITHUB_TOKEN || github.token }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+
+      - name: Build the xrepo CLI
+        working-directory: .xrepo-src
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+
+      # Key, path and restore keys are review.yml's (test/workflows.test.ts keeps them identical).
+      # The post step saves the entry when the key was not an exact hit.
+      - name: Mirror cache key
+        id: mirror-key
+        run: echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+
+      - name: Restore mirror cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ steps.paths.outputs.mirror }}
+          key: xrepo-mirror-${{ hashFiles(format('.xrepo-src/{0}', inputs.policy_file)) }}-${{ steps.mirror-key.outputs.date }}
+          restore-keys: |
+            xrepo-mirror-${{ hashFiles(format('.xrepo-src/{0}', inputs.policy_file)) }}-
+
+      - name: Sync mirror
+        env:
+          XREPO_GITHUB_TOKEN: ${{ secrets.XREPO_GITHUB_TOKEN || github.token }}
+          POLICY: ${{ steps.paths.outputs.policy }}
+          MIRROR: ${{ steps.paths.outputs.mirror }}
+        run: |
+          set -euo pipefail
+          rc=0
+          node .xrepo-src/dist/cli.js sync --policy "$POLICY" --mirror "$MIRROR" || rc=$?
+          # As in review.yml: a partial mirror is still worth caching (the review job syncs again).
+          if [ "$rc" -ne 0 ]; then echo "::warning::xrepo sync exited with $rc; the cached mirror is incomplete"; fi

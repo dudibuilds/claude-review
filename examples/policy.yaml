@@ -1,0 +1,224 @@
+# xrepo-review policy manifest (example).
+#
+# Owned by devops. Keep it OUTSIDE every PR-controlled checkout: on self-hosted runners
+# /etc/xrepo-review/policy.yaml (root-owned, read-only to the runner user), or in a devops-owned
+# repository checked out at a pinned SHA (hosted mode). `xrepo prepare` refuses a policy path that
+# resolves inside the PR checkout, the work dir or the mirror.
+#
+# Validate:   xrepo policy validate examples/policy.yaml
+# Inspect:    xrepo policy resolve examples/policy.yaml acme/payments
+#             xrepo policy tools   examples/policy.yaml acme/payments
+#
+# Every field has a safe default: an empty manifest (`version: 1`) gives a comment-only reviewer
+# that cannot approve, block or label. Objects merge recursively (built-in defaults <- `defaults`
+# <- `repos.<owner/name>`); arrays and scalars replace, except search.deny_globs /
+# search.exclude_globs, which add to the built-in lists.
+
+version: 1
+
+# --------------------------------------------------------------------------------------------
+# defaults: applies to every repository that calls the reusable workflow.
+# --------------------------------------------------------------------------------------------
+defaults:
+  # Kill switch. false = every review is skipped (outcome "skipped"). The publisher re-checks it
+  # on this file, so flipping it also stops runs that already passed prepare.
+  enabled: true
+
+  # What the agent may do. Disabled capabilities are not even registered as tools, and the
+  # publisher re-checks every rule (the agent cannot talk its way around them).
+  capabilities:
+    inline_comments:
+      enabled: true
+      max_comments: 12          # hard cap per review; most severe first
+      max_comment_chars: 1500
+      min_severity: low         # info < low < medium < high < critical
+      suggestions: true         # allow ```suggestion blocks
+    summary_comment:
+      enabled: true
+      mode: sticky              # sticky = one PR comment updated in place; review = review body
+      max_chars: 6000
+    approve:
+      enabled: false            # comment-only by default
+      max_severity_allowed: low # approve only if no finding is above this
+      never_paths: [".github/**", "**/CODEOWNERS", "**/migrations/**"]
+      max_changed_lines: 400
+    block:
+      enabled: false
+      method: check             # review = REQUEST_CHANGES | check = failing check-run | both
+      min_severity: high
+    check:
+      enabled: true             # publish a check-run "xrepo-review" with the outcome
+      name: xrepo-review
+    labels:
+      enabled: true
+      allowed: ["needs-security-review", "breaking-change"]
+
+  # Code search limits (xsearch MCP). Deny globs are never readable, listed or searchable;
+  # exclude globs are skipped unless a path/glob names them explicitly.
+  search:
+    deny_globs: ["**/*.sql.gz", "**/fixtures/customers/**"]
+    exclude_globs: ["**/generated/**"]
+    redact_secrets: true
+    max_output_chars: 30000
+    max_read_lines: 2000
+    max_filesize: 1M
+    timeout_ms: 8000
+
+  # Which mirrored repositories a PR may read (the PR's own head checkout, /pr, is always
+  # readable). Entries are "owner/name", "owner/*" or "*" (any other glob is rejected); deny wins
+  # over readable. A repos.<x>.cross_repo.deny replaces this list: repeat what must stay denied.
+  cross_repo:
+    readable: ["acme/*"]
+    deny: ["acme/secrets-vault"]
+    # Hints injected into the prompt so the agent knows where consumers live.
+    related:
+      acme/web: "calls the Orders API (createOrder, cancelOrder) from src/api/orders.ts"
+      acme/mobile: "consumes /v1/orders and the OrderCreated event schema"
+
+  # When not to review at all (outcome "skipped").
+  triggers:
+    skip_drafts: true
+    skip_forks: true            # fork PRs are a non-goal (no secrets, untrusted)
+    skip_bots: true
+    ignore_authors: ["renovate-bot"]
+    skip_title_markers: ["[skip review]", "[no review]"]
+    max_changed_files: 80
+    max_changed_lines: 4000
+    include_paths: []           # empty = every PR
+    ignore_paths: ["**/*.snap", "docs/generated/**"]
+
+  agent:
+    # model: <model id>         # omit to use the claude-code-action default
+    max_turns: 40
+    language: English
+    focus:
+      - correctness
+      - security
+      - cross-repo contract breaks
+      - error handling
+    instructions: |
+      Our services talk over HTTP+JSON; a renamed or removed JSON field is a breaking change for
+      every consumer listed under "Known cross-repo relationships".
+      Money is always integer cents; flag floating-point arithmetic on amounts.
+    # Extra Claude Code built-ins (all are disabled by default). Only non-executing tools exist here.
+    # builtin_tools: ["Skill"]
+    # Plugins are TRUSTED code chosen by devops (they can ship skills, hooks and MCP servers;
+    # MCP servers from plugins are not started because of --strict-mcp-config).
+    # plugin_marketplaces: ["https://github.com/acme/claude-plugins.git"]
+    # plugins: ["acme-review@acme-plugins"]
+    # entry_command: "/acme-review:review"   # start the prompt with this slash command
+
+  output:
+    allow_mentions: false       # "@team" becomes inert text
+    allow_images: false
+    link_allowlist: ["github.com", "docs.acme.example"]
+    footer: "Automated review by xrepo-review. Questions: #devex"
+
+  # What happens after each run. Outcomes: completed, approved, blocked (fire after completed),
+  # incomplete, usage_limit, error, skipped. Each one deep-merges over the built-in defaults
+  # (usage_limit / error / incomplete already post a short comment and a neutral check).
+  outcomes:
+    usage_limit:
+      comment: "⏸️ Review postponed: Claude usage limit reached{reset_at_suffix}. It will be retried automatically."
+      check_conclusion: neutral
+      notify:
+        - target: devex-slack
+          message: ":hourglass: {repo}#{pr_number}: review postponed (usage limit{reset_at_suffix}). {pr_url}"
+      retry:
+        enabled: true           # the `xrepo retry` sweeper re-runs the workflow
+        max_attempts: 3
+        label: "xrepo-review:retry"
+    error:
+      notify:
+        - target: devex-slack
+          message: ":warning: {repo}#{pr_number}: review failed ({reason}). {run_url}"
+    blocked:
+      notify:
+        - target: audit-webhook
+      # repository_dispatch (to the PR repo unless `repo:` names another) needs the
+      # XREPO_DISPATCH_TOKEN secret with contents: write on the target, also for the PR repo: the
+      # publish job's GITHUB_TOKEN is contents: read and cannot dispatch.
+      dispatch:
+        event_type: xrepo-review-blocked   # repository_dispatch to the PR repo
+    skipped:
+      # With a blocking check (block.method check / both, e.g. acme/payments below), a skip the PR
+      # author controls (title marker, size limits) fails the check anyway: GitHub counts a
+      # skipped check as passing. Set success or neutral here to let such skips pass.
+      check_conclusion: skipped
+
+# --------------------------------------------------------------------------------------------
+# Per-repository overrides (keys are case-insensitive owner/name).
+# --------------------------------------------------------------------------------------------
+repos:
+  acme/payments:
+    capabilities:
+      approve:
+        enabled: false          # never approve payment changes
+      block:
+        enabled: true
+        method: check           # a failing "xrepo-review" check (make it required in the ruleset)
+        min_severity: high
+      inline_comments:
+        max_comments: 20
+        min_severity: medium
+    cross_repo:
+      readable: ["acme/*", "acme-platform/ledger"]
+      related:
+        acme/checkout: "calls POST /payments/charge and expects {id, status, amount_cents}"
+        acme-platform/ledger: "consumes PaymentCaptured events (schema in proto/payments.proto)"
+    agent:
+      focus: ["money handling", "idempotency", "authz", "cross-repo contract breaks"]
+    outcomes:
+      blocked:
+        notify:
+          - target: payments-slack
+            message: ":no_entry: {repo}#{pr_number} blocked by review ({findings} findings, top {top_severity}). {pr_url}"
+          - target: audit-webhook
+        dispatch:                           # sent with XREPO_DISPATCH_TOKEN (see defaults)
+          event_type: xrepo-review-blocked
+
+  acme/docs:
+    capabilities:
+      approve:
+        enabled: true           # small doc-only PRs may be approved
+        max_severity_allowed: info
+        max_changed_lines: 150
+        never_paths: [".github/**", "**/CODEOWNERS", "**/*.js", "**/*.ts"]
+      inline_comments:
+        min_severity: info
+        max_comments: 8
+    triggers:
+      include_paths: ["**/*.md", "**/*.mdx", "docs/**"]
+    agent:
+      focus: ["factual accuracy against the code in /repos", "broken links", "outdated examples"]
+      max_turns: 25
+
+# --------------------------------------------------------------------------------------------
+# Mirror: repositories `xrepo sync` keeps as read-only snapshots for cross-repo search.
+# --------------------------------------------------------------------------------------------
+mirror:
+  repos: ["acme/*", "acme-platform/ledger"]
+  exclude: ["acme/secrets-vault"]       # exact owner/name
+  keep_snapshots: 2
+  skip_archived: true
+  skip_forks: true
+
+# --------------------------------------------------------------------------------------------
+# Notification targets. URLs and HMAC secrets are NOT in the manifest: `url_secret` /
+# `hmac_secret` name keys in the secrets bundle (env XREPO_NOTIFY_SECRETS = JSON object, or the
+# file /etc/xrepo-review/notify.json), e.g. {"devex_slack_url": "https://hooks.slack.com/..."}.
+# --------------------------------------------------------------------------------------------
+notifications:
+  devex-slack:
+    type: slack
+    url_secret: devex_slack_url
+    template: "{repo}#{pr_number}: {outcome} ({reason}) {pr_url}"
+    timeout_ms: 5000
+  payments-slack:
+    type: slack
+    url_secret: payments_slack_url
+  audit-webhook:
+    type: webhook
+    url_secret: audit_webhook_url
+    hmac_secret: audit_webhook_hmac   # adds X-Xrepo-Signature: sha256=<hex>
+    timeout_ms: 8000

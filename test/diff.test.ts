@@ -514,7 +514,7 @@ describe("PR context", () => {
   };
 
   it("CTX_FILES names", () => {
-    expect(CTX_FILES).toEqual({ pr: "pr.json", diff: "diff.patch", policy: "policy.resolved.json", prTags: "tags.pr.jsonl" });
+    expect(CTX_FILES).toEqual({ pr: "pr.json", diff: "diff.patch", policy: "policy.resolved.json" });
   });
 
   it("writeJsonAtomic + readContext round-trip, leaving no temp files", () => {
